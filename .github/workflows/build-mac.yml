@@ -35,9 +35,19 @@ jobs:
             --collect-all librosa \
             app.py
 
+      
+      - name: Package Mac application
+        run: |
+          cd dist
+          ditto -c -k --keepParent \
+            "DJ Tag Manager.app" \
+            "DJ-Tag-Manager-Mac.zip"
+
       - name: Upload Mac application
         uses: actions/upload-artifact@v4
         with:
           name: DJ-Tag-Manager-Apple-Silicon
-          path: dist/DJ Tag Manager.app/
+          path: dist/DJ-Tag-Manager-Mac.zip
+          if-no-files-found: error
+
 
