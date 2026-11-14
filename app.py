@@ -509,6 +509,9 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
         self.preferences_path = self.config_path.with_name('v3_preferences.json')
         self.load_preferences()
         self.filters = valid_column_filters(self.extra_settings.get('column_filters', {}), COLUMN_LABELS)
+        self.auto_bpm.set(bool(self.extra_settings.get('import_analyze', False)))
+        self.auto_lookup.set(bool(self.extra_settings.get('import_lookup', False)))
+        self._lookup_job_options = {}
         self.initialize_v3_storage()
         header = ttk.Frame(root, padding=(20, 17, 20, 8))
         header.pack(fill='x')
@@ -545,6 +548,7 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
         self.settings_menu.add_command(label='Check for Updates…', command=lambda: messagebox.showinfo(APP_NAME, 'Updater disabled in this isolated development preview.'))
         self.settings_menu.add_separator()
         self.settings_menu.add_command(label='API Settings…', command=self.settings)
+        self.settings_menu.add_command(label='Import & Automation…', command=self.import_automation_settings)
         self.settings_menu.add_command(label='Metadata Automation…', command=self.metadata_automation_settings)
         self.settings_menu.add_command(label='Find Cover Art for Selected MP3…', command=self.find_cover_art_selected)
         self.settings_menu.add_command(label='Backup Library…', command=self.backup_library)
@@ -1645,8 +1649,14 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
         self.status.config(text=f'{len(self.rows)} tracks loaded. {errors} unreadable files skipped.')
         self.persist_library()
         self.update_sidebar_counts()
-        if False and newly_added and (self.auto_lookup.get() or self.auto_bpm.get()):
-            self.run_job('import', newly_added)
+        if newly_added:
+            if self.auto_lookup.get():
+                # Import lookup uses the saved field preferences and still requires
+                # confirmation before writing to an audio file.
+                self.run_job('lookup_analyze' if self.auto_bpm.get() else 'lookup', newly_added,
+                             options=self._saved_lookup_options())
+            elif self.auto_bpm.get():
+                self.run_job('analyze', newly_added)
 
     def refresh(self, path):
         r = self.rows[path]
@@ -1660,17 +1670,90 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
     def selected(self):
         return list(self.tree.selection())
 
-    def run_job(self, kind, paths=None):
-        paths=self.selected() if paths is None else paths
+    def _saved_lookup_options(self):
+        stored = self.extra_settings.get('lookup_dialog', {})
+        return {'fields': list(stored.get('fields', ['year', 'genre', 'subgenre', 'art'])),
+                'mode': stored.get('mode', 'missing')}
+
+    def import_automation_settings(self):
+        win = tk.Toplevel(self.root)
+        win.title('Import & Automation')
+        win.geometry('540x290')
+        win.configure(bg=COLORS['bg'])
+        body = ttk.Frame(win, padding=20)
+        body.pack(fill='both', expand=True)
+        ttk.Label(body, text='Import & Automation', style='Brand.TLabel').pack(anchor='w', pady=(0, 12))
+        ttk.Label(body, text='Every import reads existing tags and checks for duplicate paths.').pack(anchor='w')
+        analyze = tk.BooleanVar(value=self.auto_bpm.get())
+        lookup = tk.BooleanVar(value=self.auto_lookup.get())
+        ttk.Checkbutton(body, text='Analyze BPM and Camelot key on import', variable=analyze).pack(anchor='w', pady=(15, 5))
+        ttk.Checkbutton(body, text='Find tags and artwork on import', variable=lookup).pack(anchor='w', pady=5)
+        ttk.Label(body, text='Off by default. Proposed tag writes require confirmation.').pack(anchor='w', pady=10)
+        def save():
+            self.auto_bpm.set(analyze.get())
+            self.auto_lookup.set(lookup.get())
+            self.extra_settings['import_analyze'] = analyze.get()
+            self.extra_settings['import_lookup'] = lookup.get()
+            self.save_preferences()
+            win.destroy()
+        ttk.Button(body, text='Save Settings', command=save, style='Accent.TButton').pack(anchor='e', pady=8)
+
+    def run_job(self, kind, paths=None, options=None):
+        paths = self.selected() if paths is None else list(paths)
         if not paths:
-            return messagebox.showinfo(APP_NAME,'Select one or more tracks first.')
-        if kind not in ('lookup','analyze','lookup_analyze'):
-            return messagebox.showwarning(APP_NAME,'Unsupported queued operation')
-        job_id=self.queue_engine.add(kind,paths)
+            return messagebox.showinfo(APP_NAME, 'Select one or more tracks first.')
+        if kind not in ('lookup', 'analyze', 'lookup_analyze', 'analyze_metadata'):
+            return messagebox.showwarning(APP_NAME, 'Unsupported queued operation')
+        job_id = self.queue_engine.add(kind, paths)
+        if kind in ('lookup', 'lookup_analyze', 'analyze_metadata'):
+            self._lookup_job_options[job_id] = dict(options or self._saved_lookup_options())
         self.status.configure(text=f'{kind.title()} queued for {len(paths)} tracks (task #{job_id}).')
 
     def lookup(self):
-        self.run_job('lookup_analyze')
+        paths = self.selected()
+        if not paths:
+            return messagebox.showinfo(APP_NAME, 'Select one or more tracks first.')
+        win = tk.Toplevel(self.root)
+        win.title('Find Tags & Art — Search Options')
+        win.geometry('540x610')
+        win.configure(bg=COLORS['bg'])
+        win.transient(self.root)
+        win.grab_set()
+        body = ttk.Frame(win, padding=20)
+        body.pack(fill='both', expand=True)
+        ttk.Label(body, text='Find Tags & Art', style='Brand.TLabel').pack(anchor='w')
+        ttk.Label(body, text=f'{len(paths)} selected track(s) • choose what to find').pack(anchor='w', pady=(2, 14))
+        defaults = self._saved_lookup_options()
+        fields = [('year', 'Original release year'), ('genre', 'Genre'),
+                  ('subgenre', 'Subgenre (Composer tag)'), ('bpm_tag', 'BPM (audio analysis)'),
+                  ('key', 'Musical key (Camelot, audio analysis)'), ('art', 'Album artwork')]
+        flags = {}
+        for key, label in fields:
+            flags[key] = tk.BooleanVar(value=key in defaults['fields'])
+            ttk.Checkbutton(body, text=label, variable=flags[key]).pack(anchor='w', pady=5)
+        ttk.Label(body, text='Search scope', style='Brand.TLabel').pack(anchor='w', pady=(15, 6))
+        mode = tk.StringVar(value=defaults['mode'])
+        for key, label in [('missing', 'Find missing fields only'),
+                           ('review', 'Find missing or potentially incorrect fields'),
+                           ('all', 'Compare all selected fields')]:
+            ttk.Radiobutton(body, text=label, value=key, variable=mode).pack(anchor='w', pady=3)
+        ttk.Label(body, text='All proposed changes require approval before writing files.').pack(anchor='w', pady=(12, 8))
+        buttons = ttk.Frame(body)
+        buttons.pack(side='bottom', fill='x', pady=(12, 0))
+        ttk.Button(buttons, text='Cancel', command=win.destroy).pack(side='right', padx=(8, 0))
+        def start():
+            selected_fields = [k for k, flag in flags.items() if flag.get()]
+            if not selected_fields:
+                return messagebox.showwarning('Find Tags & Art', 'Choose at least one field.', parent=win)
+            options = {'fields': selected_fields, 'mode': mode.get()}
+            self.extra_settings['lookup_dialog'] = options
+            self.save_preferences()
+            win.destroy()
+            needs_analysis = bool({'bpm_tag', 'key'} & set(selected_fields))
+            needs_lookup = bool({'year', 'genre', 'subgenre', 'art'} & set(selected_fields))
+            kind = 'lookup_analyze' if needs_lookup and needs_analysis else ('lookup' if needs_lookup else 'analyze_metadata')
+            self.run_job(kind, paths, options=options)
+        ttk.Button(buttons, text='Start Lookup', command=start, style='Accent.TButton').pack(side='right')
 
     def analyze(self):
         self.run_job('analyze')
@@ -1730,12 +1813,22 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
                         r['lookup_debug'] = result.get('lookup_debug', {})
                         r['lookup_warnings'] = result.get('errors', [])
                     r['status'] = result['error'][:65]
+                elif kind == 'analyze_metadata':
+                    options = self._lookup_job_options.get(job_id, self._saved_lookup_options())
+                    if result.get('error'):
+                        r['status'] = 'Audio analysis failed: ' + str(result['error'])[:70]
+                    else:
+                        self._confirm_lookup_write(path, {}, result, options=options)
+                        if result.get('bpm'):
+                            r['bpm'] = result['bpm']
+                        r['status'] = 'Audio analysis completed — reviewed'
                 elif kind in ('lookup', 'lookup_analyze'):
                     # Lookup + audio analysis are proposed together. Only explicit
                     # per-track confirmation can commit to the original music file.
                     analysis = result.get('analysis', {})
                     lookup_result = result.get('lookup', result)
                     result = lookup_result
+                    options = self._lookup_job_options.get(job_id, self._saved_lookup_options())
                     r['field_confidence'] = {**field_confidence(result), **analysis.get('confidence', {})}
                     r['possible_revision'] = any(0 < v < 70 for v in r['field_confidence'].values())
                     if analysis.get('bpm'):
@@ -1743,7 +1836,7 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
                     # Stage metadata for review; the Year/Genre/Composer columns
                     # display these values immediately, but MP3s change only on Save.
                     for field in ('year', 'genre', 'subgenre'):
-                        value = result.get(field, '')
+                        value = result.get(field, '') if field in options['fields'] else ''
                         key = 'suggested_' + field
                         if value:
                             r[key] = value
@@ -1760,7 +1853,9 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
                     if result.get('error') and analysis.get('error'):
                         r['status'] = 'Lookup and analysis unavailable — no write'
                     else:
-                        self._confirm_lookup_write(path, result, analysis)
+                        self._confirm_lookup_write(path, result, analysis, options=options)
+                    if 'art' in options['fields'] and result.get('recording_id') and Path(path).suffix.lower() == '.mp3':
+                        self._queue_artwork_preview(path, result['recording_id'])
                 else:
                     r['bpm'] = result['bpm']
                     if not r.get('bpm_tag'):
@@ -1772,6 +1867,15 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
         except queue.Empty:
             pass
         self.root.after(100, self.poll)
+
+    def _queue_artwork_preview(self, path, recording_id):
+        def fetch():
+            try:
+                art = artwork_from_musicbrainz(recording_id)
+                self.events.put(('cover_art_result', path, art, None))
+            except Exception as exc:
+                self.events.put(('cover_art_result', path, None, type(exc).__name__))
+        threading.Thread(target=fetch, daemon=True).start()
 
     def find_cover_art_selected(self):
         paths=self.selected()
@@ -1837,16 +1941,17 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
             self.save_preferences();win.destroy()
         ttk.Button(body,text='Save Preferences',command=save,style='Accent.TButton').pack(anchor='e',pady=18)
 
-    def _confirm_lookup_write(self, path, lookup, analysis):
+    def _confirm_lookup_write(self, path, lookup, analysis, options=None):
         """Show a per-file overwrite prompt; all writes use recovery journal."""
         r = self.rows.get(path)
         if not r:
             return
         settings = self.extra_settings.get('metadata_automation', {})
-        enabled = settings.get('fields', ['year','genre','bpm_tag','key'])
+        options = options or self._saved_lookup_options()
+        enabled = [field for field in options['fields'] if field != 'art']
         # A user must explicitly opt in to Composer/subgenre replacement.
         changes = metadata_proposal(r, lookup, analysis, fields=enabled,
-                                    replace_existing=bool(settings.get('replace_existing', False)))
+                                    replace_existing=(options['mode'] != 'missing'))
         if not changes:
             r['status'] = 'Lookup complete — no eligible new fields'
             return

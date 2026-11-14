@@ -39,6 +39,9 @@ class IntegratedWorkflows:
                 except Exception as exc: analysis={'error':type(exc).__name__}
                 return {'lookup':found,'analysis':analysis}
             return found
+        if kind=='analyze_metadata':
+            from metadata_automation import analyze_audio
+            return analyze_audio(path)
         if kind=='analyze':return analyze_cues(path)
         if kind=='key':
             import librosa
