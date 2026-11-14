@@ -21,24 +21,45 @@ def get(url, params=None, headers=None, auth=None):
     r.raise_for_status()
     return r.json()
 
-def musicbrainz(artist,title):
-    # Prefer precise matching, then retry with a less restrictive query.
-    data=get('https://musicbrainz.org/ws/2/recording/', {'query':f'artist:"{artist}" AND recording:"{title}"','fmt':'json','limit':10})
-    if not data.get('recordings'):
-        data=get('https://musicbrainz.org/ws/2/recording/', {'query':f'{artist} {title}','fmt':'json','limit':20})
-    recs=[r for r in data.get('recordings',[]) if similar(r.get('title',''),title) and any(similar(a.get('name',''),artist) for a in r.get('artist-credit',[]) if isinstance(a,dict))]
-    if not recs:return None
-    best=max(recs,key=lambda x:x.get('score',0))
-    years=[int(r['first-release-date'][:4]) for r in recs if re.match(r'^\d{4}',r.get('first-release-date',''))]
-    # Search results often omit genre tags. Fetch the recording directly.
-    tags=best.get('tags',[]) or best.get('genres',[])
-    if not tags and best.get('id'):
+def musicbrainz(artist, title):
+    """Try strict then broad recording searches; retrieve tags beyond search results."""
+    queries = [f'artist:"{artist}" AND recording:"{title}"',
+               f'recording:"{title}" AND artist:{artist}',
+               f'{artist} {title}']
+    recs = []
+    for query in queries:
+        data = get('https://musicbrainz.org/ws/2/recording/',
+                   {'query': query, 'fmt': 'json', 'limit': 25})
+        recs = [r for r in data.get('recordings', [])
+                if similar(r.get('title', ''), title) and
+                (any(similar(a.get('name', ''), artist)
+                     for a in r.get('artist-credit', []) if isinstance(a, dict))
+                 or similar(r.get('artist-credit-phrase', ''), artist))]
+        if recs:
+            break
+        time.sleep(1.1)  # Respect MusicBrainz request rate limits.
+    if not recs:
+        return None
+    best = max(recs, key=lambda x: int(x.get('score') or 0))
+    years = [int(r['first-release-date'][:4]) for r in recs
+             if re.match(r'^\d{4}', r.get('first-release-date', ''))]
+    tags = best.get('genres', []) or best.get('tags', [])
+    if best.get('id'):
         try:
-            details=get('https://musicbrainz.org/ws/2/recording/'+best['id'], {'inc':'genres+tags','fmt':'json'})
-            tags=details.get('genres',[]) or details.get('tags',[])
+            time.sleep(1.1)
+            details = get('https://musicbrainz.org/ws/2/recording/' + best['id'],
+                          {'inc': 'genres+tags+releases', 'fmt': 'json'})
+            tags = details.get('genres', []) or details.get('tags', []) or tags
+            if not years:
+                for release in details.get('releases', []):
+                    date = release.get('date', '')
+                    if re.match(r'^\d{4}', date):
+                        years.append(int(date[:4]))
         except (requests.RequestException, ValueError):
             pass
-    return {'source':'MusicBrainz','year':min(years) if years else None,'tags':[x['name'] for x in sorted(tags,key=lambda t:t.get('count',0),reverse=True) if x.get('name')], 'confidence':best.get('score',0)}
+    return {'source': 'MusicBrainz', 'year': min(years) if years else None,
+            'tags': [x['name'] for x in sorted(tags, key=lambda t: t.get('count', 0), reverse=True)
+                     if x.get('name')], 'confidence': best.get('score', 0)}
 
 def lastfm(artist,title,key):
     if not key:return None
@@ -73,8 +94,8 @@ def spotify(artist,title,client_id,secret):
 
 # Order matters: specific labels first, broad fallbacks afterward.
 GENRES={
- 'R&B':['contemporary r&b','alternative r&b','new jack swing','neo soul','rhythm and blues','r&b','rnb','soul'],
- 'Hip Hop':['southern hip hop','east coast hip hop','west coast hip hop','trap','drill','boom bap','hip-hop','hip hop','rap'],
+ 'R&B':['contemporary r&b','alternative r&b','new jack swing','neo soul','rhythm and blues','r&b','rnb','r&b/soul','urban contemporary','soul'],
+ 'Hip Hop':['southern hip hop','east coast hip hop','west coast hip hop','trap','drill','boom bap','hip-hop','hip hop','hip hop/rap','rap'],
  'Afrobeats':['afrobeats','afropop','afro pop','afro-fusion','afroswing'],
  'Dancehall':['dancehall','ragga'],
  'Reggae':['roots reggae','reggae','dub'],

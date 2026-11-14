@@ -37,16 +37,16 @@ def apply_dark_theme(root):
     style.theme_use('clam')
     root.configure(background=COLORS['bg'])
     style.configure('.', background=COLORS['bg'], foreground=COLORS['text'],
-                    font=('Helvetica', 11))
+                    font=('Helvetica', 13))
     style.configure('TFrame', background=COLORS['bg'])
     style.configure('Panel.TFrame', background=COLORS['panel'])
     style.configure('TLabel', background=COLORS['bg'], foreground=COLORS['text'])
     style.configure('Muted.TLabel', background=COLORS['bg'], foreground=COLORS['muted'])
     style.configure('Brand.TLabel', background=COLORS['bg'], foreground=COLORS['accent'],
-                    font=('Helvetica', 19, 'bold'))
+                    font=('Helvetica', 21, 'bold'))
     style.configure('TButton', background=COLORS['raised'], foreground=COLORS['text'],
                     borderwidth=0, padding=(13, 9), relief='flat',
-                    font=('Helvetica', 10, 'bold'))
+                    font=('Helvetica', 12, 'bold'))
     style.map('TButton', background=[('pressed', COLORS['hover']),
                                      ('active', COLORS['hover'])],
               foreground=[('disabled', COLORS['muted'])])
@@ -63,13 +63,13 @@ def apply_dark_theme(root):
               lightcolor=[('focus', COLORS['accent'])])
     style.configure('Treeview', background=COLORS['panel'],
                     fieldbackground=COLORS['panel'], foreground=COLORS['text'],
-                    rowheight=34, borderwidth=0, relief='flat',
-                    font=('Helvetica', 11))
+                    rowheight=39, borderwidth=0, relief='flat',
+                    font=('Helvetica', 13))
     style.map('Treeview', background=[('selected', COLORS['select'])],
               foreground=[('selected', COLORS['accent'])])
     style.configure('Treeview.Heading', background=COLORS['raised'],
                     foreground=COLORS['muted'], padding=(12, 11),
-                    borderwidth=0, relief='flat', font=('Helvetica', 10, 'bold'))
+                    borderwidth=0, relief='flat', font=('Helvetica', 12, 'bold'))
     style.map('Treeview.Heading', background=[('active', COLORS['hover'])],
               foreground=[('active', COLORS['accent'])])
     style.configure('TScrollbar', background=COLORS['raised'],
@@ -92,13 +92,13 @@ def style_plain_widget(widget):
                          selectbackground=COLORS['select'],
                          relief='flat', highlightthickness=1,
                          highlightbackground=COLORS['line'], padx=12, pady=10,
-                         font=('Menlo', 10))
+                         font=('Menlo', 12))
     elif isinstance(widget, tk.Listbox):
         widget.configure(bg=COLORS['panel'], fg=COLORS['text'],
                          selectbackground=COLORS['select'],
                          selectforeground=COLORS['accent'],
                          highlightthickness=0, relief='flat',
-                         font=('Helvetica', 11))
+                         font=('Helvetica', 13))
     elif isinstance(widget, tk.Canvas):
         widget.configure(bg=COLORS['bg'])
 
@@ -373,7 +373,7 @@ def apply_tag_changes(path, changes, custom_changes):
 class App:
     def __init__(self, root):
         self.root = root
-        root.title(APP_NAME + ' 1.6')
+        root.title(APP_NAME + ' 1.7')
         root.geometry('1300x780')
         root.minsize(1050, 650)
         apply_dark_theme(root)
@@ -383,6 +383,7 @@ class App:
         self.config_path = Path.home() / 'Library' / 'Application Support' / 'DJ Tag Manager' / 'api_keys.json'
         self.config = self.load_config()
         self.auto_lookup = tk.BooleanVar(value=True)
+        self.auto_bpm = tk.BooleanVar(value=True)
         self.save_names = tk.BooleanVar(value=False)
         self.layout_path = self.config_path.with_name('column_layout.json')
         self.visible_columns = self.load_column_layout()
@@ -411,6 +412,7 @@ class App:
         self.settings_menu.add_command(label='Choose Columns…', command=self.choose_columns)
         self.settings_menu.add_separator()
         self.settings_menu.add_checkbutton(label='Auto lookup on import/drop', variable=self.auto_lookup)
+        self.settings_menu.add_checkbutton(label='Auto BPM analysis on import/drop', variable=self.auto_bpm)
         self.settings_menu.add_checkbutton(label='Include artist/title when writing tags', variable=self.save_names)
         self.settings_button = ttk.Button(toolbar, text='⚙ Settings', command=self.open_settings_menu)
         self.settings_button.pack(side='right', padx=(8, 0))
@@ -438,9 +440,16 @@ class App:
                 print(f'Drag-and-drop unavailable: {exc}')
         if not self.dnd_available:
             self.drop_label.config(text='Drag and drop unavailable in this build; use Add MP3s / Add Folder')
-        self.tree = ttk.Treeview(root, columns=tuple(COLUMN_LABELS), show='headings', selectmode='extended')
+        table_frame = ttk.Frame(root)
+        table_frame.pack(fill='both', expand=True, padx=16, pady=(8, 6))
+        self.tree = ttk.Treeview(table_frame, columns=tuple(COLUMN_LABELS), show='headings', selectmode='extended')
+        self.table_vscroll = ttk.Scrollbar(table_frame, orient='vertical', command=self.tree.yview)
+        self.table_hscroll = ttk.Scrollbar(table_frame, orient='horizontal', command=self.tree.xview)
+        self.tree.configure(yscrollcommand=self.table_vscroll.set, xscrollcommand=self.table_hscroll.set)
+        self.table_vscroll.pack(side='right', fill='y')
+        self.table_hscroll.pack(side='bottom', fill='x')
         self.configure_columns()
-        self.tree.pack(fill='both', expand=True, padx=16, pady=(8, 6))
+        self.tree.pack(side='left', fill='both', expand=True)
         self.tree.tag_configure('odd', background=COLORS['panel'])
         self.tree.tag_configure('even', background='#19202B')
         self.tree.bind('<<TreeviewSelect>>', self.show_details)
@@ -864,7 +873,7 @@ class App:
         ttk.Label(window, text=f'{COLUMN_LABELS[field]} — {Path(path).name}',
                   wraplength=730).grid(row=0, column=0, sticky='w', padx=16, pady=(12, 6))
         value = tk.StringVar(value=str(original))
-        entry = ttk.Entry(window, textvariable=value, font=('Helvetica', 14))
+        entry = ttk.Entry(window, textvariable=value, font=('Helvetica', 16))
         entry.grid(row=1, column=0, sticky='ew', padx=16, pady=4, ipady=5)
         entry.focus_set()
         entry.select_range(0, tk.END)
@@ -924,8 +933,8 @@ class App:
             except Exception:
                 errors += 1
         self.status.config(text=f'{len(self.rows)} MP3s loaded. {errors} unreadable files skipped.')
-        if newly_added and self.auto_lookup.get():
-            self.run_job('lookup', newly_added)
+        if newly_added and (self.auto_lookup.get() or self.auto_bpm.get()):
+            self.run_job('import', newly_added)
 
     def refresh(self, path):
         r = self.rows[path]
@@ -951,11 +960,12 @@ class App:
         def work():
             for index, path in enumerate(paths):
                 r = self.rows[path]
-                if kind == 'lookup':
+                if kind in ('lookup', 'import') and (kind == 'lookup' or self.auto_lookup.get()):
                     result = multi_lookup(r.get('suggested_artist') or r['artist'], r.get('suggested_title') or r['title'], self.config)
-                else:
+                    self.events.put(('result', 'lookup', path, result))
+                if kind in ('analyze', 'import') and (kind == 'analyze' or self.auto_bpm.get()):
                     result = analyze_cues(path)
-                self.events.put(('result', kind, path, result))
+                    self.events.put(('result', 'analyze', path, result))
             self.events.put(('done', kind, len(paths)))
         threading.Thread(target=work, daemon=True).start()
 
@@ -995,8 +1005,10 @@ class App:
                     r['status'] = 'Lookup: ' + ', '.join(result['sources']) if result['sources'] else 'No match'
                 else:
                     r['bpm'] = result['bpm']
+                    if not r.get('bpm_tag'):
+                        r.setdefault('pending_tags', {})['bpm_tag'] = str(result['bpm'])
                     r['cues'] = result['cues']
-                    r['status'] = 'Cue suggestions ready'
+                    r['status'] = 'BPM analyzed — save to write tag'
                 self.refresh(path)
                 self.show_details()
         except queue.Empty:
