@@ -43,7 +43,7 @@ def apply_dark_theme(root):
     style.configure('TLabel', background=COLORS['bg'], foreground=COLORS['text'])
     style.configure('Muted.TLabel', background=COLORS['bg'], foreground=COLORS['muted'])
     style.configure('Brand.TLabel', background=COLORS['bg'], foreground=COLORS['accent'],
-                    font=('Helvetica', 21, 'bold'))
+                    font=('Helvetica Neue', 23, 'bold'))
     style.configure('TButton', background=COLORS['raised'], foreground=COLORS['text'],
                     borderwidth=0, padding=(13, 9), relief='flat',
                     font=('Helvetica', 12, 'bold'))
@@ -373,7 +373,7 @@ def apply_tag_changes(path, changes, custom_changes):
 class App:
     def __init__(self, root):
         self.root = root
-        root.title(APP_NAME + ' 1.7')
+        root.title(APP_NAME + ' 1.8')
         root.geometry('1300x780')
         root.minsize(1050, 650)
         apply_dark_theme(root)
@@ -389,32 +389,38 @@ class App:
         self.visible_columns = self.load_column_layout()
         header = ttk.Frame(root, padding=(20, 17, 20, 8))
         header.pack(fill='x')
-        ttk.Label(header, text='DJ  /  TAG MANAGER', style='Brand.TLabel').pack(side='left')
+        ttk.Label(header, text='DJ Tag Manager', style='Brand.TLabel').pack(side='left')
         ttk.Label(header, text='  MUSIC LIBRARY  •  METADATA WORKSPACE',
                   style='Muted.TLabel').pack(side='left', padx=(12, 0))
-        toolbar = ttk.Frame(root, padding=(16, 8, 16, 12))
+        # The gear is in the header, not a horizontally overflowing toolbar.
+        toolbar = ttk.Frame(root, padding=(16, 8, 16, 8))
         toolbar.pack(fill='x')
-        for label, cmd in [('Add MP3s', self.add_files), ('Add Folder', self.add_folder),
-                           ('Lookup Selected', self.lookup), ('Analyze Cues', self.analyze),
-                           ('Write Selected Tags', self.write), ('Export Cue Suggestions', self.export)]:
+        for label, cmd in [('Add Music', self.add_files), ('Add Folder', self.add_folder),
+                           ('Lookup Metadata', self.lookup), ('Analyze BPM', self.analyze),
+                           ('Save Changes', self.write)]:
             ttk.Button(toolbar, text=label, command=cmd,
-                       style='Accent.TButton' if label == 'Write Selected Tags' else 'TButton').pack(side='left', padx=3)
-        ttk.Button(toolbar, text='Suggest Artist / Title', command=self.suggest_split).pack(side='left', padx=3)
-        ttk.Button(toolbar, text='All Metadata', command=self.all_metadata).pack(side='left', padx=3)
-        ttk.Button(toolbar, text='Edit All Tags', command=self.edit_all_tags).pack(side='left', padx=3)
-        ttk.Button(toolbar, text='Show in Finder', command=self.reveal_selected).pack(side='left', padx=3)
+                       style='Accent.TButton' if label == 'Save Changes' else 'TButton').pack(side='left', padx=3)
+        self.more_menu = tk.Menu(root, tearoff=False, bg=COLORS['panel'], fg=COLORS['text'],
+                                 activebackground=COLORS['select'], activeforeground=COLORS['accent'])
+        for label, cmd in [('Auto-Fix Title', self.suggest_split), ('View Metadata', self.all_metadata),
+                           ('Edit Metadata', self.edit_all_tags), ('Show in Finder', self.reveal_selected),
+                           ('Export Cue Suggestions', self.export)]:
+            self.more_menu.add_command(label=label, command=cmd)
+        more_button = ttk.Button(toolbar, text='More Actions  ···', command=lambda: self.show_popup(self.more_menu, more_button))
+        more_button.pack(side='left', padx=3)
         # Keep configuration out of the main toolbar. Each menu item opens its
         # existing dialog or toggles a preference without modifying MP3 files.
         self.settings_menu = tk.Menu(root, tearoff=False, bg=COLORS['panel'],
                                      fg=COLORS['text'], activebackground=COLORS['select'],
                                      activeforeground=COLORS['accent'], borderwidth=0)
         self.settings_menu.add_command(label='API Settings…', command=self.settings)
-        self.settings_menu.add_command(label='Choose Columns…', command=self.choose_columns)
+        self.settings_menu.add_command(label='Genre Lookup Diagnostics…', command=self.show_lookup_debug)
+        self.settings_menu.add_command(label='Customize Columns…', command=self.choose_columns)
         self.settings_menu.add_separator()
         self.settings_menu.add_checkbutton(label='Auto lookup on import/drop', variable=self.auto_lookup)
         self.settings_menu.add_checkbutton(label='Auto BPM analysis on import/drop', variable=self.auto_bpm)
         self.settings_menu.add_checkbutton(label='Include artist/title when writing tags', variable=self.save_names)
-        self.settings_button = ttk.Button(toolbar, text='⚙ Settings', command=self.open_settings_menu)
+        self.settings_button = ttk.Button(header, text='⚙ Settings', command=self.open_settings_menu)
         self.settings_button.pack(side='right', padx=(8, 0))
         editor = ttk.Frame(root, padding=(10, 3))
         editor.pack(fill='x')
@@ -475,6 +481,13 @@ class App:
         self.status.pack(fill='x')
         root.after(100, self.poll)
 
+    def show_popup(self, menu, button):
+        self.root.update_idletasks()
+        try:
+            menu.tk_popup(button.winfo_rootx(), button.winfo_rooty() + button.winfo_height())
+        finally:
+            menu.grab_release()
+
     def open_settings_menu(self):
         # Anchor the popup to the gear button, rather than the mouse pointer.
         self.root.update_idletasks()
@@ -490,7 +503,7 @@ class App:
         for col in COLUMN_LABELS:
             self.tree.heading(col, text=COLUMN_LABELS[col])
             width = 200 if col in ('title', 'path', 'status') else 150 if col in ('artist', 'album', 'composer') else 110
-            self.tree.column(col, width=width, minwidth=60, stretch=True)
+            self.tree.column(col, width=width, minwidth=60, stretch=True, anchor='center')
 
     def load_column_layout(self):
         """Restore column visibility/order, ignoring fields removed by upgrades."""
@@ -510,71 +523,88 @@ class App:
             messagebox.showwarning(APP_NAME, f'Column layout could not be saved: {exc}')
 
     def choose_columns(self):
-        """Choose and reorder visible columns without modifying any MP3 tags."""
+        """Searchable, scrollable, clearly checked column picker."""
         window = tk.Toplevel(self.root)
         style_popup(window)
-        window.title('Customize Song List Columns')
-        window.geometry('560x610')
-        ttk.Label(window, text='Check fields to display. Select a field and use Up / Down to change its position. Hidden tags are never deleted.',
-                  wraplength=520).pack(anchor='w', padx=12, pady=10)
-        outer = ttk.Frame(window, padding=10)
-        outer.pack(fill='both', expand=True)
-        ordered = list(self.visible_columns) + [key for key in COLUMN_LABELS if key not in self.visible_columns]
-        checked = {key: key in self.visible_columns for key in COLUMN_LABELS}
-        listbox = tk.Listbox(outer, selectmode='browse', exportselection=False)
+        window.title('Customize Columns')
+        window.geometry('490x650')
+        window.minsize(400, 450)
+        ordered = list(self.visible_columns) + [k for k in COLUMN_LABELS if k not in self.visible_columns]
+        checked = {k: k in self.visible_columns for k in COLUMN_LABELS}
+        ttk.Label(window, text='Customize Columns', style='Brand.TLabel').pack(anchor='w', padx=18, pady=(15, 3))
+        counter = ttk.Label(window, style='Muted.TLabel')
+        counter.pack(anchor='w', padx=18)
+        search = tk.StringVar()
+        ttk.Entry(window, textvariable=search).pack(fill='x', padx=18, pady=10)
+        controls = ttk.Frame(window)
+        controls.pack(fill='x', padx=16, pady=(0, 8))
+        ttk.Button(controls, text='Show All', command=lambda: set_preset('all')).pack(side='left', padx=2)
+        ttk.Button(controls, text='Hide All', command=lambda: set_preset('none')).pack(side='left', padx=2)
+        ttk.Button(controls, text='DJ Default', command=lambda: set_preset('default')).pack(side='left', padx=2)
+        holder = ttk.Frame(window)
+        holder.pack(fill='both', expand=True, padx=18)
+        listbox = tk.Listbox(holder, selectmode='browse', exportselection=False, activestyle='none')
         style_plain_widget(listbox)
-        scrollbar = ttk.Scrollbar(outer, orient='vertical', command=listbox.yview)
-        listbox.configure(yscrollcommand=scrollbar.set)
+        scroller = ttk.Scrollbar(holder, orient='vertical', command=listbox.yview)
+        listbox.configure(yscrollcommand=scroller.set)
         listbox.pack(side='left', fill='both', expand=True)
-        scrollbar.pack(side='left', fill='y')
-        def render(selected=None):
+        scroller.pack(side='right', fill='y')
+        filtered = []
+        def render(keep=None):
+            nonlocal filtered
+            filtered = [k for k in ordered if search.get().lower() in COLUMN_LABELS[k].lower()]
             listbox.delete(0, 'end')
-            for key in ordered:
-                listbox.insert('end', ('☑  ' if checked[key] else '☐  ') + COLUMN_LABELS[key])
-            if selected in ordered:
-                index = ordered.index(selected)
-                listbox.selection_set(index)
-                listbox.see(index)
+            for k in filtered:
+                listbox.insert('end', ('☑  ' if checked[k] else '☐  ') + COLUMN_LABELS[k])
+            if keep in filtered:
+                i = filtered.index(keep)
+                listbox.selection_set(i)
+                listbox.see(i)
+            counter.configure(text=f'{sum(checked.values())} of {len(checked)} columns visible  •  Yellow = enabled')
         def current():
             selection = listbox.curselection()
-            return ordered[selection[0]] if selection else None
-        def toggle():
-            key = current()
-            if key:
-                checked[key] = not checked[key]
-                render(key)
-        def move(delta):
-            key = current()
-            if key is None: return
-            index = ordered.index(key)
-            new_index = index + delta
-            if 0 <= new_index < len(ordered):
-                ordered[index], ordered[new_index] = ordered[new_index], ordered[index]
-                render(key)
-        controls = ttk.Frame(outer, padding=(12, 0))
-        controls.pack(side='left', fill='y')
-        ttk.Button(controls, text='Show / Hide', command=toggle).pack(fill='x', pady=4)
-        ttk.Button(controls, text='Move Up', command=lambda: move(-1)).pack(fill='x', pady=4)
-        ttk.Button(controls, text='Move Down', command=lambda: move(1)).pack(fill='x', pady=4)
-        ttk.Button(controls, text='Show All', command=lambda: (checked.update({k: True for k in checked}), render(current()))).pack(fill='x', pady=(22,4))
-        ttk.Button(controls, text='Hide All', command=lambda: (checked.update({k: False for k in checked}), render(current()))).pack(fill='x', pady=4)
-        ttk.Button(controls, text='DJ Defaults', command=lambda: (checked.update({k: k in DEFAULT_COLUMNS for k in checked}), ordered.__setitem__(slice(None), list(DEFAULT_COLUMNS) + [k for k in COLUMN_LABELS if k not in DEFAULT_COLUMNS]), render())).pack(fill='x', pady=(22,4))
-        listbox.bind('<Double-1>', lambda event: toggle())
-        listbox.bind('<space>', lambda event: (toggle(), 'break')[1])
-        render()
+            return filtered[selection[0]] if selection else None
+        def toggle(event=None):
+            k = current()
+            if k:
+                checked[k] = not checked[k]
+                render(k)
+        def move(direction):
+            k = current()
+            if not k: return
+            i = ordered.index(k)
+            j = i + direction
+            if 0 <= j < len(ordered):
+                ordered[i], ordered[j] = ordered[j], ordered[i]
+                render(k)
+        def set_preset(mode):
+            if mode == 'default':
+                ordered[:] = list(DEFAULT_COLUMNS) + [k for k in COLUMN_LABELS if k not in DEFAULT_COLUMNS]
+            for k in checked:
+                checked[k] = mode == 'all' or (mode == 'default' and k in DEFAULT_COLUMNS)
+            render()
+        search.trace_add('write', lambda *_: render())
+        listbox.bind('<Double-1>', toggle)
+        listbox.bind('<space>', lambda e: (toggle(), 'break')[1])
+        buttons = ttk.Frame(window)
+        buttons.pack(fill='x', padx=18, pady=8)
+        ttk.Button(buttons, text='Toggle Selected', command=toggle).pack(side='left', padx=2)
+        ttk.Button(buttons, text='↑ Move Up', command=lambda: move(-1)).pack(side='left', padx=2)
+        ttk.Button(buttons, text='↓ Move Down', command=lambda: move(1)).pack(side='left', padx=2)
         def apply():
-            chosen = [key for key in ordered if checked[key]]
+            chosen = [k for k in ordered if checked[k]]
             if not chosen:
-                messagebox.showwarning(APP_NAME, 'Select at least one visible column.', parent=window)
+                messagebox.showwarning(APP_NAME, 'Keep at least one column visible.', parent=window)
                 return
             self.visible_columns = chosen
             self.configure_columns()
             self.save_column_layout()
             window.destroy()
-        footer = ttk.Frame(window, padding=12)
-        footer.pack(fill='x')
-        ttk.Button(footer, text='Cancel', command=window.destroy).pack(side='right', padx=5)
-        ttk.Button(footer, text='Apply & Save Layout', style='Accent.TButton', command=apply).pack(side='right', padx=5)
+        footer = ttk.Frame(window)
+        footer.pack(fill='x', padx=18, pady=(2, 15))
+        ttk.Button(footer, text='Cancel', command=window.destroy).pack(side='right', padx=4)
+        ttk.Button(footer, text='Apply Columns', style='Accent.TButton', command=apply).pack(side='right', padx=4)
+        render()
 
     def on_header_context_menu(self, event):
         """Show the visibility checklist only when right-clicking a column header."""
@@ -583,16 +613,7 @@ class App:
         menu = tk.Menu(self.tree, tearoff=False, bg=COLORS['panel'],
                        fg=COLORS['text'], activebackground=COLORS['select'],
                        activeforeground=COLORS['accent'])
-        menu.add_command(label='Show / Hide Columns', state='disabled')
-        menu.add_separator()
-        for key, label in COLUMN_LABELS.items():
-            selected = tk.BooleanVar(value=key in self.visible_columns)
-            menu.add_checkbutton(
-                label=label, variable=selected,
-                command=lambda k=key: self.toggle_column(k),
-            )
-        menu.add_separator()
-        menu.add_command(label='More column options…', command=self.choose_columns)
+        menu.add_command(label='Customize Columns…', command=self.choose_columns)
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -679,6 +700,18 @@ class App:
                 window.clipboard_clear()
                 window.clipboard_append(data)
         ttk.Button(window, text='Copy Selected Metadata', command=copy_selected).pack(pady=8)
+
+    def show_lookup_debug(self):
+        paths = self.selected()
+        if not paths:
+            messagebox.showinfo(APP_NAME, 'Select a track to inspect its lookup diagnostics.')
+            return
+        r = self.rows[paths[0]]
+        if 'lookup_debug' not in r:
+            messagebox.showinfo(APP_NAME, 'Run Lookup Metadata first. Diagnostic results will appear in the raw JSON panel.')
+            return
+        self.show_details()
+        messagebox.showinfo(APP_NAME, 'The selected track’s lookup_debug object is in the raw JSON panel below the song list. No API keys are included.')
 
     def reveal_selected(self):
         paths = self.selected()
@@ -988,6 +1021,9 @@ class App:
                 if not r:
                     continue
                 if result.get('error'):
+                    if kind == 'lookup':
+                        r['lookup_debug'] = result.get('lookup_debug', {})
+                        r['lookup_warnings'] = result.get('errors', [])
                     r['status'] = result['error'][:65]
                 elif kind == 'lookup':
                     # Stage metadata for review; the Year/Genre/Composer columns
@@ -999,6 +1035,7 @@ class App:
                             r[key] = value
                         else:
                             r.pop(key, None)
+                    r['lookup_debug'] = result.get('lookup_debug', {})
                     r['sources'] = result['sources']
                     r['lookup_warnings'] = result['errors']
                     r['match'] = str(result['score'])

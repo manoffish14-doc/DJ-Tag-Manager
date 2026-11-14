@@ -120,23 +120,56 @@ def classify(tags):
                 return broad, tag.title() if cleaned != broad.casefold() else ''
     return '', ''
 
-def lookup(artist,title,config):
-    if not artist or not title:return {'error':'Artist and title are needed for lookup.'}
-    results=[];errors=[]
-    providers=[('MusicBrainz',lambda:musicbrainz(artist,title)),('Last.fm',lambda:lastfm(artist,title,config.get('lastfm',''))),('Discogs',lambda:discogs(artist,title,config.get('discogs',''))),('Spotify',lambda:spotify(artist,title,config.get('spotify_id',''),config.get('spotify_secret','')))]
-    for name,fn in providers:
+def lookup(artist, title, config):
+    """Return per-provider, redacted diagnostics to explain missing genres."""
+    debug = {'search_artist': artist, 'search_title': title, 'providers': {},
+             'genre_candidates': [], 'rejected_tags': [], 'genre_decision': {}}
+    if not artist or not title:
+        return {'error': 'Artist and title are needed for lookup.', 'lookup_debug': debug,
+                'sources': [], 'errors': []}
+    results, errors = [], []
+    providers = [
+        ('MusicBrainz', True, lambda: musicbrainz(artist, title)),
+        ('Last.fm', bool(config.get('lastfm')), lambda: lastfm(artist, title, config.get('lastfm', ''))),
+        ('Discogs', bool(config.get('discogs')), lambda: discogs(artist, title, config.get('discogs', ''))),
+        ('Spotify', bool(config.get('spotify_id') and config.get('spotify_secret')),
+         lambda: spotify(artist, title, config.get('spotify_id', ''), config.get('spotify_secret', ''))),
+    ]
+    for name, configured, fn in providers:
+        if not configured:
+            debug['providers'][name] = {'status': 'not_configured', 'tags': []}
+            continue
         try:
-            item=fn()
-            if item:results.append(item)
-        except Exception as e:errors.append(f'{name}: {str(e)[:90]}')
-        if name=='MusicBrainz':time.sleep(1.05)
-    years=[r['year'] for r in results if r.get('year')]
-    # Track-specific tags first (Last.fm), then release styles (Discogs), then MusicBrainz.
-    tags=[]
-    for name in ('Last.fm','Discogs','MusicBrainz'):
-        tags.extend(t for r in results if r['source']==name for t in r.get('tags',[]))
-    genre,subgenre=classify(tags)
-    # When only a broad tag is available, don't invent a specific subgenre.
-    return {'year':str(min(years)) if years else '', 'genre':genre,'subgenre':subgenre,
-            'sources':[r['source'] for r in results], 'errors':errors,'tags':tags[:20],
-            'score':'Review', 'error': 'No matching metadata found.' if not results else None}
+            item = fn()
+            if item:
+                results.append(item)
+                debug['providers'][name] = {'status': 'matched', 'year': item.get('year'),
+                    'tags': item.get('tags', [])[:30], 'confidence': item.get('confidence')}
+            else:
+                debug['providers'][name] = {'status': 'no_matching_recording', 'tags': []}
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            # Never include request URLs, headers, or exception text: they can contain API keys.
+            reason = f'HTTP {status}' if status else 'HTTP error'
+            debug['providers'][name] = {'status': 'request_failed', 'reason': reason, 'tags': []}
+            errors.append(f'{name}: {reason}')
+        except Exception as exc:
+            # A provider can include credential values in raw exception strings.
+            reason = type(exc).__name__
+            debug['providers'][name] = {'status': 'request_failed', 'reason': reason, 'tags': []}
+            errors.append(f'{name}: {reason}')
+        if name == 'MusicBrainz':
+            time.sleep(1.05)
+    years = [r['year'] for r in results if r.get('year')]
+    tags = []
+    for name in ('Last.fm', 'Discogs', 'MusicBrainz'):
+        tags.extend(t for r in results if r['source'] == name for t in r.get('tags', []))
+    genre, subgenre = classify(tags)
+    debug['genre_candidates'] = tags[:40]
+    debug['rejected_tags'] = [t for t in tags if t.casefold().strip() in GENERIC]
+    debug['genre_decision'] = {'genre': genre or None, 'subgenre': subgenre or None,
+        'reason': 'recognized_genre_tag' if genre else ('unrecognized_or_generic_tags' if tags else 'no_genre_tags_returned')}
+    return {'year': str(min(years)) if years else '', 'genre': genre, 'subgenre': subgenre,
+            'sources': [r['source'] for r in results], 'errors': errors, 'tags': tags[:20],
+            'score': 'Review', 'lookup_debug': debug,
+            'error': 'No matching metadata found.' if not results else None}
