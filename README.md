@@ -1,29 +1,13 @@
-# DJ Tag Manager — Mac app build kit
+# DJ Tag Manager v0.3 — Apple Silicon Mac
 
-This kit builds a standalone macOS `.app` **in GitHub Actions on a Mac runner**. You do **not** need Python installed on your own Mac.
+Adds drag-and-drop import of MP3s and folders, and reviewable artist/title splitting for common YouTube titles (e.g. `Artist - Title`).
 
-## Build it without installing Python
+## Update your GitHub repository
 
-1. Sign in to GitHub and create a **private** repository.
-2. Upload `app.py`, `requirements.txt`, and `.github/workflows/build-mac.yml` to the repository, preserving the `.github/workflows` path. GitHub's browser uploader can upload the extracted folder contents; alternatively use GitHub Desktop.
-3. In the repository, open **Actions → Build Mac App → Run workflow**. A push to `main` also starts a build.
-4. After the run succeeds, open the run and download the `DJ-Tag-Manager-macOS` artifact.
-5. Unzip the artifact and then unzip `DJ-Tag-Manager-macOS.zip` if needed. Drag `DJ Tag Manager.app` to **Applications**.
+Replace `app.py`, `requirements.txt`, and `.github/workflows/build-mac.yml` in the repository with the files in this ZIP. Keep the same relative paths. Commit to `main`; the Actions workflow will rebuild the application. Download the successful Actions artifact, unzip it, unzip the inner Mac ZIP, and drag `DJ Tag Manager.app` into Applications, replacing the old copy after quitting it.
 
-This app is **unsigned and unnotarized**. macOS Gatekeeper may block it. If macOS says the developer cannot be verified, use **System Settings → Privacy & Security → Open Anyway** only if you trust the app you built from this source. Do not bypass warnings for unfamiliar files.
+## How to use
 
-## What it does
+Drag MP3s or folders onto the drop zone or track list. Select a track and click **Suggest Artist / Title**. The editable suggestion boxes let you correct the split; click **Apply to selected row**. MusicBrainz lookup uses suggestions automatically. Check **Also write artist/title to MP3** if you want them saved, then use **Write Selected Tags**. The original MP3 is updated in place, with no automatic backup or duplicate file. The filename and location remain unchanged.
 
-- Imports MP3s and folders
-- Looks up approximate original year and available genre via MusicBrainz (internet needed)
-- Writes reviewed year and genre ID3 tags
-- Estimates BPM and suggests cue times, exportable to JSON
-
-## Not yet supported
-
-- Writing Serato hot cues, audio fingerprint recognition, verified song section identification
-- Signed Apple installer or notarization
-
-## Important
-
-This build recipe is provided but **has not been run or verified on a macOS runner**. PyInstaller and audio dependencies may need adjustments. Always test with duplicate MP3s, and back up your library first. For best compatibility, build on a Mac runner matching your Mac architecture. This workflow targets the GitHub-hosted macos-15-arm64 runner for Apple Silicon. Runner availability and build success depend on GitHub account/repository settings; the workflow has not been executed here.
+Caution: The split is heuristic and requires review; it does not guarantee correct matches. Cue analysis is only suggested timestamps; no Serato cue data is written. Because writes have no automatic undo, test on a manually copied song before editing your main Serato library.

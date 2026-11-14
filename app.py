@@ -1,5 +1,8 @@
 """DJ Tag Manager: local macOS-friendly MP3 metadata editor."""
 import json
+import re
+import shutil
+from datetime import datetime
 import queue
 import threading
 import time
@@ -8,10 +11,16 @@ from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
 
 import requests
-from mutagen.id3 import ID3, ID3NoHeaderError, TDRC, TCON, TXXX
+from mutagen.id3 import ID3, ID3NoHeaderError, TDRC, TCON, TIT2, TPE1
 from mutagen.mp3 import MP3
 
-APP_NAME = 'DJ Tag Manager'
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except ImportError:
+    DND_FILES = None
+    TkinterDnD = None
+
+APP_NAME = 'DJ Tag Manager' 
 USER_AGENT = 'DJTagManager/0.1 (local desktop application)'
 
 
@@ -24,6 +33,20 @@ def read_track(path):
     return {'path': str(path), 'title': value('TIT2') or Path(path).stem,
             'artist': value('TPE1'), 'year': value('TDRC') or value('TYER'),
             'genre': value('TCON'), 'duration': audio.info.length}
+
+
+def split_artist_title(raw):
+    """Conservative suggestions for common YouTube title patterns."""
+    text = re.sub(r'\s+', ' ', raw or '').strip()
+    text = re.sub(r'^(?:\[?official(?: music)? video\]?\s*[-:]+\s*)', '', text, flags=re.I)
+    # Split only on separators that are unlikely to be part of a name.
+    for separator in (' - ', ' – ', ' — ', ' | '):
+        if separator in text:
+            artist, title = text.split(separator, 1)
+            artist, title = artist.strip(), title.strip()
+            if artist and title and len(artist) <= 100:
+                return artist, title
+    return None
 
 
 def lookup_musicbrainz(artist, title):
@@ -90,7 +113,7 @@ def analyze_cues(path):
         return {'error': str(exc)}
 
 
-def write_tags(path, year, genre):
+def write_tags(path, year, genre, artist=None, title=None):
     try:
         tags = ID3(path)
     except ID3NoHeaderError:
@@ -99,13 +122,17 @@ def write_tags(path, year, genre):
         tags.setall('TDRC', [TDRC(encoding=3, text=[year])])
     if genre:
         tags.setall('TCON', [TCON(encoding=3, text=[genre])])
+    if artist is not None:
+        tags.setall('TPE1', [TPE1(encoding=3, text=[artist])])
+    if title is not None:
+        tags.setall('TIT2', [TIT2(encoding=3, text=[title])])
     tags.save(path, v2_version=3)
 
 
 class App:
     def __init__(self, root):
         self.root = root
-        root.title(APP_NAME + ' 0.1')
+        root.title(APP_NAME + ' 0.2')
         root.geometry('1040x650')
         self.rows = {}
         self.events = queue.Queue()
@@ -116,6 +143,27 @@ class App:
                            ('Lookup Selected', self.lookup), ('Analyze Cues', self.analyze),
                            ('Write Selected Tags', self.write), ('Export Cue Suggestions', self.export)]:
             ttk.Button(toolbar, text=label, command=cmd).pack(side='left', padx=3)
+        ttk.Button(toolbar, text='Suggest Artist / Title', command=self.suggest_split).pack(side='left', padx=3)
+        editor = ttk.Frame(root, padding=(10, 3))
+        editor.pack(fill='x')
+        ttk.Label(editor, text='Suggested artist:').pack(side='left')
+        self.artist_edit = tk.StringVar()
+        ttk.Entry(editor, textvariable=self.artist_edit, width=25).pack(side='left', padx=4)
+        ttk.Label(editor, text='Suggested title:').pack(side='left')
+        self.title_edit = tk.StringVar()
+        ttk.Entry(editor, textvariable=self.title_edit, width=37).pack(side='left', padx=4)
+        ttk.Button(editor, text='Apply to selected row', command=self.apply_split).pack(side='left', padx=4)
+        self.save_names = tk.BooleanVar(value=False)
+        ttk.Checkbutton(editor, text='Also write artist/title to MP3', variable=self.save_names).pack(side='left')
+        self.drop_label = ttk.Label(root, text='Drop MP3 files or folders here (or onto the song list)',
+                                    anchor='center', padding=14, relief='groove')
+        self.drop_label.pack(fill='x', padx=10, pady=(3, 3))
+        if DND_FILES and hasattr(root, 'drop_target_register'):
+            for target in (root, self.drop_label):
+                target.drop_target_register(DND_FILES)
+                target.dnd_bind('<<Drop>>', self.on_drop)
+        else:
+            self.drop_label.config(text='Drag and drop unavailable in this build; use Add MP3s / Add Folder')
         columns = ('title', 'artist', 'year', 'genre', 'match', 'bpm', 'status')
         self.tree = ttk.Treeview(root, columns=columns, show='headings', selectmode='extended')
         widths = (210, 160, 70, 130, 70, 65, 200)
@@ -124,6 +172,9 @@ class App:
             self.tree.column(col, width=width, minwidth=50)
         self.tree.pack(fill='both', expand=True, padx=10, pady=5)
         self.tree.bind('<<TreeviewSelect>>', self.show_details)
+        if DND_FILES and hasattr(self.tree, 'drop_target_register'):
+            self.tree.drop_target_register(DND_FILES)
+            self.tree.dnd_bind('<<Drop>>', self.on_drop)
         self.details = tk.Text(root, height=9, wrap='word')
         self.details.pack(fill='x', padx=10, pady=5)
         self.status = ttk.Label(root, text='Ready. Add MP3s or a folder.', padding=10)
@@ -138,10 +189,54 @@ class App:
         if folder:
             self.add_paths(sorted(Path(folder).rglob('*.mp3')))
 
+    def on_drop(self, event):
+        # Tk's splitlist handles filenames containing spaces and braces.
+        paths = self.root.tk.splitlist(event.data)
+        self.add_paths(paths)
+
+    def suggest_split(self):
+        paths = self.selected()
+        if not paths:
+            messagebox.showinfo(APP_NAME, 'Select tracks to suggest artist/title.')
+            return
+        count = 0
+        for path in paths:
+            r = self.rows[path]
+            split = split_artist_title(r.get('title', ''))
+            if split:
+                r['suggested_artist'], r['suggested_title'] = split
+                r['status'] = 'Artist/title suggestion ready'
+                count += 1
+                self.refresh(path)
+        self.show_details()
+        self.status.config(text=f'Suggested artist/title for {count}/{len(paths)} selected tracks. Review before writing.')
+
+    def apply_split(self):
+        paths = self.selected()
+        if len(paths) != 1:
+            messagebox.showinfo(APP_NAME, 'Select exactly one track to edit its artist/title suggestion.')
+            return
+        artist, title = self.artist_edit.get().strip(), self.title_edit.get().strip()
+        if not artist or not title:
+            messagebox.showwarning(APP_NAME, 'Artist and title must both be filled in.')
+            return
+        r = self.rows[paths[0]]
+        r['suggested_artist'], r['suggested_title'] = artist, title
+        r['status'] = 'Edited artist/title suggestion ready'
+        self.refresh(paths[0])
+        self.show_details()
+
     def add_paths(self, paths):
         errors = 0
-        for path in paths:
-            path = str(path)
+        expanded = []
+        for incoming in paths:
+            incoming = Path(incoming).expanduser()
+            if incoming.is_dir():
+                expanded.extend(p for p in incoming.rglob('*') if p.is_file() and p.suffix.lower() == '.mp3')
+            elif incoming.is_file() and incoming.suffix.lower() == '.mp3':
+                expanded.append(incoming)
+        for path in expanded:
+            path = str(path.resolve())
             if path in self.rows:
                 continue
             try:
@@ -177,7 +272,7 @@ class App:
             for index, path in enumerate(paths):
                 r = self.rows[path]
                 if kind == 'lookup':
-                    result = lookup_musicbrainz(r['artist'], r['title'])
+                    result = lookup_musicbrainz(r.get('suggested_artist') or r['artist'], r.get('suggested_title') or r['title'])
                     if index < len(paths)-1:
                         time.sleep(1.1)  # MusicBrainz public API rate limit
                 else:
@@ -226,23 +321,31 @@ class App:
         self.details.delete('1.0', 'end')
         if selected:
             r = self.rows[selected[0]]
+            self.artist_edit.set(r.get('suggested_artist', r.get('artist', '')))
+            self.title_edit.set(r.get('suggested_title', r.get('title', '')))
             self.details.insert('end', json.dumps({k:v for k,v in r.items() if k != 'duration'}, indent=2))
 
     def write(self):
         paths = self.selected()
-        ready = [p for p in paths if 'suggested_year' in self.rows[p] or 'suggested_genre' in self.rows[p]]
+        ready = [p for p in paths if any(k in self.rows[p] for k in ('suggested_year', 'suggested_genre'))
+                 or (self.save_names.get() and all(k in self.rows[p] for k in ('suggested_artist', 'suggested_title')))]
         if not ready:
-            messagebox.showinfo(APP_NAME, 'Look up selected tracks first. No changes made.')
+            messagebox.showinfo(APP_NAME, 'Nothing to write. Run lookup or suggest artist/title first.')
             return
-        if not messagebox.askyesno(APP_NAME, f'Write suggested year/genre to {len(ready)} MP3(s)? Existing year/genre tags may be replaced. Make a backup first.'):
+        names = self.save_names.get()
+        if not messagebox.askyesno(APP_NAME,
+                f'Write suggested year/genre' + (' and artist/title' if names else '') +
+                f' directly to {len(ready)} original MP3(s)?\n\nNo duplicate MP3 or backup will be created. These edits cannot be automatically undone.'):
             return
         success = 0
         for path in ready:
             r = self.rows[path]
             try:
-                write_tags(path, r.get('suggested_year', ''), r.get('suggested_genre', ''))
+                artist = r.get('suggested_artist') if names else None
+                title = r.get('suggested_title') if names else None
+                write_tags(path, r.get('suggested_year', ''), r.get('suggested_genre', ''), artist, title)
                 r.update(read_track(path))
-                r['status'] = 'Tags written'
+                r['status'] = 'Tags written in place'
                 success += 1
             except Exception as exc:
                 r['status'] = f'Write failed: {exc}'
