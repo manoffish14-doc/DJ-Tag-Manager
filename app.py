@@ -1,5 +1,10 @@
 """DJ Tag Manager: local macOS-friendly MP3 metadata editor."""
 import json
+import os
+import sys
+import sqlite3
+import subprocess
+from datetime import timezone
 import hashlib
 import copy
 import math
@@ -20,8 +25,12 @@ from pathlib import Path
 import requests
 from mutagen.id3 import ID3, ID3NoHeaderError, TDRC, TCON, TIT2, TPE1, TCOM, TXXX, COMM, Frames
 from metadata_sources import lookup as multi_lookup
+from metadata_automation import proposal as metadata_proposal, field_confidence, analyze_audio, artwork_from_musicbrainz, write_mp3_cover_art
+from metadata_safety import safe_write, fingerprint, FileChangedError, history as metadata_history, restore_write
+from workspace_layout import sidebar_width, valid_column_filters
 from update_manager import show_update_dialog
 from mutagen.mp3 import MP3
+from mutagen import File as MutagenFile
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -31,10 +40,10 @@ except ImportError:
 
 # DJ Tag Manager visual system: charcoal surfaces, warm yellow highlights.
 COLORS = {
-    'bg': '#0B0E13', 'panel': '#141922', 'raised': '#1C2330',
-    'hover': '#293241', 'line': '#303947', 'text': '#F3F5F8',
-    'muted': '#A6B0BF', 'accent': '#FFD23F', 'accent_hover': '#FFE17B',
-    'select': '#4C411C', 'input': '#10151D',
+    'bg': '#1D2026', 'panel': '#242830', 'raised': '#30353E',
+    'hover': '#3A414B', 'line': '#343A44', 'text': '#F3F5F8',
+    'muted': '#A6B0BF', 'accent': '#FACC15', 'accent_hover': '#FFE17B',
+    'select': '#3B424B', 'input': '#1B1E24',
 }
 
 
@@ -104,7 +113,7 @@ def apply_dark_theme(root):
               lightcolor=[('focus', COLORS['accent'])])
     style.configure('Treeview', background=COLORS['panel'],
                     fieldbackground=COLORS['panel'], foreground=COLORS['text'],
-                    rowheight=39, borderwidth=0, relief='flat',
+                    rowheight=36, borderwidth=0, relief='flat',
                     font=('Helvetica', 13))
     style.map('Treeview', background=[('selected', COLORS['select'])],
               foreground=[('selected', COLORS['accent'])])
@@ -411,10 +420,65 @@ def apply_tag_changes(path, changes, custom_changes):
             tags.add(TXXX(encoding=3, desc=description, text=[value]))
     tags.save(path, v2_version=3)
 
-class App:
+AUDIO_EXTENSIONS = {'.mp3', '.flac', '.m4a', '.aiff', '.aif', '.wav'}
+SERATO_DEFAULTS = {
+    'enabled': False, 'read': True, 'write': False, 'show_crates': True,
+    'manage_library': False, 'show_cues': True, 'show_loops': True,
+    'bpm_beatgrid': True, 'track_colors': False, 'relocate': False,
+    'sync_mode': 'manual', 'library_location': ''
+}
+
+
+def read_any_track(path):
+    if Path(path).suffix.lower() == '.mp3':
+        return dict(read_track(path), disk_fingerprint=fingerprint(path))
+    audio = MutagenFile(path, easy=True)
+    if audio is None or audio.info is None:
+        raise ValueError('Unsupported or unreadable audio file')
+    def val(k):
+        v = audio.get(k, [])
+        return str(v[0]) if v else ''
+    duration = float(getattr(audio.info, 'length', 0))
+    bitrate = getattr(audio.info, 'bitrate', 0)
+    return dict(path=str(path), title=val('title') or Path(path).stem,
+        artist=val('artist'), album=val('album'), album_artist=val('albumartist'),
+        year=val('date'), genre=val('genre'), composer=val('composer'),
+        bpm_tag=val('bpm'), key=val('initialkey'), comment=val('comment'),
+        duration=duration, duration_display=f'{int(duration // 60)}:{int(duration % 60):02d}',
+        bitrate=f'{round(bitrate / 1000)} kbps' if bitrate else '',
+        sample_rate=f'{getattr(audio.info, "sample_rate", 0)} Hz',
+        filename=Path(path).name, disk_fingerprint=fingerprint(path))
+
+
+def write_any_tags(path, changes, custom_changes=None):
+    if Path(path).suffix.lower() == '.mp3':
+        return apply_tag_changes(path, changes, custom_changes or {})
+    # Only supported, standard fields; do not touch proprietary Serato blocks.
+    mapping = {'title':'title', 'artist':'artist', 'album':'album',
+        'album_artist':'albumartist', 'year':'date', 'genre':'genre',
+        'composer':'composer', 'track_number':'tracknumber',
+        'disc_number':'discnumber', 'bpm_tag':'bpm'}
+    unknown = set(changes) - set(mapping)
+    if unknown or custom_changes:
+        raise ValueError('These tags are not safely supported for this file format: ' + ', '.join(sorted(unknown)))
+    audio = MutagenFile(path, easy=True)
+    if audio is None:
+        raise ValueError('Unsupported format')
+    if audio.tags is None:
+        audio.add_tags()
+    for key, value in changes.items():
+        audio[mapping[key]] = [str(value)] if value else []
+    audio.save()
+
+
+from advanced_ui import AdvancedTools
+from integrated_workflows import IntegratedWorkflows
+from waveform_player import WaveformController
+
+class App(IntegratedWorkflows, AdvancedTools):
     def __init__(self, root):
         self.root = root
-        root.title(APP_NAME + ' 3.0')
+        root.title(APP_NAME + ' 3.1.0 Combined Development')
         root.geometry('1300x780')
         root.minsize(1050, 650)
         apply_dark_theme(root)
@@ -425,21 +489,26 @@ class App:
         self.progress_window = None
         self.help_enabled = tk.BooleanVar(value=False)
         self.filters = {}
+        self._sidebar_drag_origin = None
         self.undo_stack = []
         self.redo_stack = []
         self.saved_views = {}
         self.genre_groups = {}
         self._tooltip = None
         self._tooltip_after = None
-        self.config_path = Path.home() / 'Library' / 'Application Support' / 'DJ Tag Manager' / 'api_keys.json'
+        self.config_path = Path.home() / 'Library' / 'Application Support' / 'DJ Tag Manager v3 Combined Dev' / 'api_keys.json'
         self.config = self.load_config()
-        self.auto_lookup = tk.BooleanVar(value=True)
-        self.auto_bpm = tk.BooleanVar(value=True)
+        self.auto_lookup = tk.BooleanVar(value=False)
+        self.lookup_write_mode = tk.StringVar(value='confirm_each')
+        self.auto_bpm = tk.BooleanVar(value=False)
         self.save_names = tk.BooleanVar(value=False)
         self.layout_path = self.config_path.with_name('column_layout.json')
         self.visible_columns = self.load_column_layout()
+        self.column_widths = self.load_column_widths()
         self.preferences_path = self.config_path.with_name('v3_preferences.json')
         self.load_preferences()
+        self.filters = valid_column_filters(self.extra_settings.get('column_filters', {}), COLUMN_LABELS)
+        self.initialize_v3_storage()
         header = ttk.Frame(root, padding=(20, 17, 20, 8))
         header.pack(fill='x')
         ttk.Label(header, text='DJ Tag Manager', style='Brand.TLabel').pack(side='left')
@@ -449,8 +518,8 @@ class App:
         toolbar = ttk.Frame(root, padding=(16, 8, 16, 8))
         toolbar.pack(fill='x')
         self.toolbar_buttons = {}
-        for label, cmd in [('Add Music', self.add_files), ('Add Folder', self.add_folder),
-                           ('Lookup Metadata', self.lookup), ('Analyze BPM', self.analyze),
+        for label, cmd in [('Import Files', self.add_files), ('Import Folder', self.add_folder), ('Scan Library', self.scan_library),
+                           ('Find Tags & Art', self.lookup), ('Analyze BPM', self.analyze),
                            ('Save Changes', self.write)]:
             button = ttk.Button(toolbar, text=label, command=cmd,
                        style='Accent.TButton' if label == 'Save Changes' else 'TButton')
@@ -472,13 +541,18 @@ class App:
         self.settings_menu = tk.Menu(root, tearoff=False, bg=COLORS['panel'],
                                      fg=COLORS['text'], activebackground=COLORS['select'],
                                      activeforeground=COLORS['accent'], borderwidth=0)
-        self.settings_menu.add_command(label='Check for Updates…', command=lambda: show_update_dialog(self.root))
+        self.settings_menu.add_command(label='Check for Updates…', command=lambda: messagebox.showinfo(APP_NAME, 'Updater disabled in this isolated development preview.'))
         self.settings_menu.add_separator()
         self.settings_menu.add_command(label='API Settings…', command=self.settings)
+        self.settings_menu.add_command(label='Metadata Automation…', command=self.metadata_automation_settings)
+        self.settings_menu.add_command(label='Find Cover Art for Selected MP3…', command=self.find_cover_art_selected)
+        self.settings_menu.add_command(label='Serato Integration…', command=self.serato_settings)
+        self.settings_menu.add_command(label='Backup Library…', command=self.backup_library)
+        self.settings_menu.add_command(label='Restore Library Backup…', command=self.restore_library_backup)
         self.settings_menu.add_command(label='Genre Lookup Diagnostics…', command=self.show_lookup_debug)
         self.settings_menu.add_separator()
-        self.settings_menu.add_checkbutton(label='Auto lookup on import/drop', variable=self.auto_lookup)
-        self.settings_menu.add_checkbutton(label='Auto BPM analysis on import/drop', variable=self.auto_bpm)
+        # v3: import never triggers network lookup automatically
+        # v3: import never triggers analysis automatically
         self.settings_menu.add_checkbutton(label='Include artist/title when writing tags', variable=self.save_names)
         self.settings_button = ttk.Button(header, text='⚙ Settings', command=self.open_settings_menu)
         self.settings_button.pack(side='right', padx=(8, 0))
@@ -489,7 +563,7 @@ class App:
         self.install_help()
         if self.help_enabled.get():
             self.help_button.configure(bg=COLORS['accent'],fg=COLORS['bg'])
-        self.drop_label = ttk.Label(root, text='↓   DROP MP3 FILES OR FOLDERS HERE   •   AUTOMATIC LOOKUP ON IMPORT',
+        self.drop_label = ttk.Label(root, text='↓   DROP MUSIC FILES OR FOLDERS HERE   •   MANUAL LOOKUP & ANALYSIS',
                                     anchor='center', padding=17, style='Muted.TLabel')
         self.drop_label.pack(fill='x', padx=10, pady=(3, 3))
         self.dnd_available = False
@@ -503,8 +577,18 @@ class App:
                 print(f'Drag-and-drop unavailable: {exc}')
         if not self.dnd_available:
             self.drop_label.config(text='Drag and drop unavailable in this build; use Add MP3s / Add Folder')
-        table_frame = ttk.Frame(root)
-        table_frame.pack(fill='both', expand=True, padx=16, pady=(8, 6))
+        self.content = ttk.Frame(root)
+        self.content.pack(fill='both', expand=True, padx=16, pady=(8, 6))
+        self.sidebar = tk.Frame(self.content, bg='#15171B', width=sidebar_width(self.extra_settings.get('sidebar_width', 240)))
+        self.sidebar.pack(side='left', fill='y', padx=(0,0))
+        self._sidebar_grip = tk.Frame(self.content, bg=COLORS['line'], width=5, cursor='sb_h_double_arrow')
+        self._sidebar_grip.pack(side='left', fill='y', padx=(0,10))
+        self._sidebar_grip.bind('<ButtonPress-1>', self._sidebar_resize_start)
+        self._sidebar_grip.bind('<B1-Motion>', self._sidebar_resize_move)
+        self._sidebar_grip.bind('<ButtonRelease-1>', self._sidebar_resize_end)
+        self.sidebar.pack_propagate(False)
+        table_frame = ttk.Frame(self.content)
+        table_frame.pack(side='left', fill='both', expand=True)
         self.tree = ttk.Treeview(table_frame, columns=tuple(COLUMN_LABELS), show='headings', selectmode='extended')
         self.table_vscroll = tk.Scrollbar(table_frame, orient='vertical', command=self.tree.yview,
             width=7, bg=COLORS['raised'], troughcolor=COLORS['bg'], relief='flat',
@@ -518,20 +602,20 @@ class App:
         self.configure_columns()
         self.tree.pack(side='left', fill='both', expand=True)
         self.tree.tag_configure('odd', background=COLORS['panel'])
-        self.tree.tag_configure('even', background='#19202B')
+        self.tree.tag_configure('even', background=COLORS['panel'])
         self.tree.bind('<<TreeviewSelect>>', self.show_details)
         self.tree.bind('<Command-a>', self.select_all_visible)
         self.tree.bind('<Control-a>', self.select_all_visible)
         self.tree.bind('<Escape>', lambda e: self.tree.selection_remove(self.tree.selection()))
-        self.root.bind_all('<Command-z>', self.undo, add='+')
-        self.root.bind_all('<Command-Shift-Z>', self.redo, add='+')
-        self.root.bind_all('<Command-Shift-z>', self.redo, add='+')
-        self.tree.bind('<Double-1>', self.edit_song_cell)
+        # Keyboard actions are installed by IntegratedWorkflows so remapping is reliable.
+        self.tree.bind('<Double-1>', self.play_clicked_song)
+        self.tree.bind('<Button-1>', self.maybe_edit_selected_cell, add='+')
         self.tree.bind('<Button-2>', self.on_header_context_menu)
         self.tree.bind('<Button-3>', self.on_header_context_menu)
         self.tree.bind('<Control-Button-1>', self.on_header_context_menu)
         self.tree.bind('<ButtonPress-1>', self.on_header_press, add='+')
         self.tree.bind('<ButtonRelease-1>', self.on_header_release, add='+')
+        self.tree.bind('<Shift-Button-1>', self.on_shift_header_sort, add='+')
         self._header_drag = None
         self.inline_editor = None
         if self.dnd_available and hasattr(self.tree, 'drop_target_register'):
@@ -543,12 +627,317 @@ class App:
         self.details = tk.Text(root, height=7, wrap='word')
         style_plain_widget(self.details)
         self.details.pack(fill='x', padx=16, pady=(6, 5))
+        self.build_player()
         self.status = ttk.Label(root, text='●  Ready  •  Add MP3s or drop a folder to begin',
                                 padding=(20, 12), style='Muted.TLabel')
         self.status.pack(fill='x')
         self.selection_status = ttk.Label(root, text='0 of 0 tracks selected', style='Muted.TLabel')
         self.selection_status.pack(anchor='e', padx=20, pady=(0, 4))
+        self.build_sidebar()
+        self.restore_library()
+        self.setup_advanced()
+        self.setup_integrated()
+        self._setup_sidebar_toggle()
+        if self.filters:
+            self.apply_filters()
+        root.protocol('WM_DELETE_WINDOW', self.close_app)
         root.after(100, self.poll)
+
+    def initialize_v3_storage(self):
+        self.data_dir = self.config_path.parent
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.library_file = self.data_dir / 'v3_preview_library.json'
+        self.player_process = None
+        self.player_path = None
+        self.last_double_click = 0
+        self.sidebar_buttons = {}
+        self.current_view = 'All Tracks'
+
+    def persist_library(self):
+        self.library_file.parent.mkdir(parents=True, exist_ok=True)
+        payload = {'paths':list(self.rows), 'last_track':self.player_path}
+        tmp = self.library_file.with_suffix('.tmp')
+        tmp.write_text(json.dumps(payload, indent=2), encoding='utf-8')
+        os.replace(tmp, self.library_file)
+
+    def restore_library(self):
+        try:
+            saved = json.loads(self.library_file.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return
+        for path in saved.get('paths', []):
+            if path in self.rows:
+                continue
+            if not Path(path).is_file():
+                self.rows[path] = dict(path=path, title=Path(path).stem, artist='',
+                    status='Missing file', genre='', bitrate='', duration_display='')
+            else:
+                try:
+                    self.rows[path] = read_any_track(path)
+                    self.rows[path].update(status='Loaded', match='', bpm='', cues=[])
+                except Exception:
+                    self.rows[path] = dict(path=path, title=Path(path).stem,
+                        artist='', status='Unreadable file')
+            self.refresh(path)
+        self.player_path = saved.get('last_track')
+        self.update_player_label()
+        self.update_sidebar_counts()
+
+    def scan_library(self):
+        changed = 0
+        for path, row in self.rows.items():
+            if not Path(path).is_file():
+                row['status'] = 'Missing file'
+                changed += 1
+            else:
+                try:
+                    current = read_any_track(path)
+                    if any(current.get(k) != row.get(k) for k in ('title','artist','genre','year')):
+                        row.update(current)
+                        row['status'] = 'Updated from disk'
+                        changed += 1
+                except Exception:
+                    row['status'] = 'Unreadable file'
+                    changed += 1
+            self.refresh(path)
+        self.persist_library()
+        self.update_sidebar_counts()
+        self.status.configure(text=f'Scan complete: {changed} changed or missing tracks.')
+
+    def build_sidebar(self):
+        # A separate left panel is placed next to the existing content.
+        # Sidebar is embedded in the library content frame.
+        tk.Label(self.sidebar, text='LIBRARY', bg='#15171B', fg=COLORS['accent'],
+            font=('Helvetica', 11, 'bold')).pack(anchor='w', padx=14, pady=(12,6))
+        for name in ('All Tracks','Missing Files','Missing Tags','Low Bitrate','Unreviewed','Possible Revisions'):
+            button = tk.Button(self.sidebar, text=name, anchor='w', bg='#15171B', fg='#F5F5F5',
+                activebackground='#292D35', activeforeground=COLORS['accent'],
+                borderwidth=0, padx=14, pady=8,
+                command=lambda n=name:self.choose_view(n))
+            button.pack(fill='x')
+            self.sidebar_buttons[name] = button
+        tk.Label(self.sidebar, text='LIBRARY TOOLS', bg='#15171B', fg=COLORS['accent'],
+            font=('Helvetica', 11, 'bold')).pack(anchor='w', padx=14, pady=(15,5))
+        for name, action in [('Duplicates',self.find_duplicates),('Genre Cleanup',self.genre_cleanup),
+            ('Smart Filters',self.smart_filters),('Serato Settings',self.serato_settings),('Relocate Missing',self.relocate_missing)]:
+            tk.Button(self.sidebar, text=name, anchor='w', bg='#15171B', fg='#F5F5F5',
+                borderwidth=0, padx=14, pady=7, command=action).pack(fill='x')
+        self.choose_view('All Tracks')
+
+    def update_sidebar_counts(self):
+        if not hasattr(self, 'sidebar_buttons'):
+            return
+        for name, button in self.sidebar_buttons.items():
+            count = sum(self.matches_view(r, name) for r in self.rows.values())
+            button.configure(text=f'{name}  ({count})')
+
+    def matches_view(self, row, name):
+        if name == 'All Tracks': return True
+        if name == 'Missing Files': return not Path(row['path']).is_file()
+        if name == 'Missing Tags': return not row.get('artist') or not row.get('genre')
+        if name == 'Low Bitrate':
+            match = re.search(r'\d+', str(row.get('bitrate','')))
+            return bool(match and int(match.group()) < self.extra_settings.get('low_bitrate',320))
+        if name == 'Unreviewed': return row.get('status') != 'Tags written in place'
+        if name == 'Possible Revisions': return 'revision' in row.get('status','').lower()
+        return True
+
+    def choose_view(self, name):
+        self.current_view = name
+        for n, button in self.sidebar_buttons.items():
+            button.configure(fg=COLORS['accent'] if n == name else '#F5F5F5')
+        for path, row in self.rows.items():
+            visible = self.matches_view(row,name)
+            if visible and self.tree.exists(path): self.tree.move(path, '', 'end')
+            elif not visible and self.tree.exists(path): self.tree.detach(path)
+        if hasattr(self,'advanced_filter') and self.advanced_filter.get('rules'):
+            self._apply_advanced_filter()
+        self.show_details()
+
+    def build_player(self):
+        bar = tk.Frame(self.root, bg='#292D35', height=52)
+        bar.pack(fill='x', side='bottom', padx=12, pady=(0,5))
+        self.player_button = tk.Button(bar, text='▶', command=self.toggle_playback,
+            bg='#292D35', fg=COLORS['accent'], borderwidth=0, font=('Helvetica',16,'bold'))
+        self.player_button.pack(side='left', padx=12)
+        self.player_label = tk.Label(bar, text='No track loaded', bg='#292D35', fg='#F5F5F5',
+            font=('Helvetica',12), anchor='w')
+        self.player_label.pack(side='left', fill='x', expand=True)
+        self.waveform_controller=WaveformController(self,bar)
+
+    def update_player_label(self):
+        if not hasattr(self, 'player_label'): return
+        r = self.rows.get(self.player_path, {})
+        self.player_label.configure(text=(f"{r.get('title',Path(self.player_path).stem)}  —  {r.get('artist','')}"
+            if self.player_path else 'No track loaded'))
+
+    def play_clicked_song(self, event):
+        self.last_double_click = time.monotonic()
+        path = self.tree.identify_row(event.y)
+        if path:
+            self.play_track(path)
+        return 'break'
+
+    def maybe_edit_selected_cell(self, event):
+        # A click on an already-selected cell opens editing; never on the first selection click.
+        path = self.tree.identify_row(event.y)
+        if path and path in self.tree.selection() and self.tree.identify_region(event.x,event.y) == 'cell':
+            self.root.after(240, lambda p=path, x=event.x, y=event.y:
+                self.edit_song_cell(type('Click', (), {'x':x,'y':y})())
+                if p in self.tree.selection() and time.monotonic()-self.last_double_click > .35 else None)
+
+    def play_track(self, path):
+        if not Path(path).is_file():
+            return messagebox.showwarning(APP_NAME, 'Track is missing. Relocate it before playing.')
+        self.stop_playback()
+        self.player_path = path
+        self.update_player_label()
+        self.waveform_controller.load(path)
+        self._launch_playback(0)
+        self.persist_library()
+
+    def _launch_playback(self, seconds=0):
+        if not self.player_path or not Path(self.player_path).is_file(): return
+        self.stop_playback()
+        if sys.platform != 'darwin':
+            return messagebox.showinfo(APP_NAME, 'Audio preview requires macOS afplay.')
+        args=['/usr/bin/afplay','-v',str(self.waveform_controller.volume.get())]
+        if seconds>0:
+            if not self.waveform_controller.seek_supported:
+                return self.status.configure(text='Seeking unavailable on this afplay version.')
+            args+=['-s',str(seconds)]
+        args.append(self.player_path)
+        try:
+            self.player_process=subprocess.Popen(args,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            self.player_button.configure(text='■')
+            self.waveform_controller.start_position=seconds
+            self.waveform_controller.position=seconds
+            self.waveform_controller.started=time.monotonic()
+        except OSError as exc:messagebox.showerror(APP_NAME,f'Playback unavailable: {exc}')
+
+    def stop_playback(self):
+        if self.player_process and self.player_process.poll() is None:
+            self.player_process.terminate()
+        self.player_process=None
+        if hasattr(self,'waveform_controller'):self.waveform_controller.started=None
+        if hasattr(self,'player_button'):self.player_button.configure(text='▶')
+
+    def toggle_playback(self):
+        if self.player_process and self.player_process.poll() is None:self.stop_playback()
+        elif self.player_path:self._launch_playback(self.waveform_controller.position)
+        elif self.selected():self.play_track(self.selected()[0])
+
+    def serato_settings(self):
+        win=tk.Toplevel(self.root)
+        win.title('Serato Integration — Preview')
+        win.geometry('570x680')
+        win.configure(bg=COLORS['bg'])
+        ttk.Label(win,text='Serato Integration',style='Brand.TLabel').pack(anchor='w',padx=18,pady=15)
+        ttk.Label(win,text='Read-only foundation. Proprietary writes are disabled until tested.',
+            style='Muted.TLabel').pack(anchor='w',padx=18,pady=(0,12))
+        options = [
+            ('enabled','Enable Serato Integration'),('read','Read Serato Data'),
+            ('write','Write Serato Data (not yet supported)'),('show_crates','Show Serato Crates'),
+            ('manage_library','Create & Manage Serato Library (not yet supported)'),
+            ('show_cues','Show Serato Hot Cues'),('show_loops','Show Saved Loops'),
+            ('bpm_beatgrid','Read BPM & Beatgrids'),('track_colors','Track Colors & Ratings'),
+            ('relocate','Relocate Serato Tracks (not yet supported)')]
+        vars = {}
+        for key,label in options:
+            v=tk.BooleanVar(value=self.serato_options.get(key,False))
+            vars[key]=v
+            cb=ttk.Checkbutton(win,text=label,variable=v)
+            cb.pack(anchor='w',padx=24,pady=6)
+            if key in ('write','manage_library','relocate'):
+                cb.configure(state='disabled')
+        ttk.Label(win,text='Serato Library Location',style='Muted.TLabel').pack(anchor='w',padx=18,pady=(15,4))
+        location=tk.StringVar(value=self.serato_options.get('library_location',''))
+        ttk.Entry(win,textvariable=location).pack(fill='x',padx=18)
+        def browse():
+            folder=filedialog.askdirectory(parent=win)
+            if folder:location.set(folder)
+        ttk.Button(win,text='Choose Folder…',command=browse).pack(anchor='w',padx=18,pady=8)
+        def save():
+            self.serato_options.update({k:v.get() for k,v in vars.items()})
+            self.serato_options['write']=False
+            self.serato_options['manage_library']=False
+            self.serato_options['relocate']=False
+            self.serato_options['sync_mode']='manual'
+            self.serato_options['library_location']=location.get().strip()
+            self.save_preferences()
+            win.destroy()
+        ttk.Button(win,text='Save Settings',style='Accent.TButton',command=save).pack(pady=12)
+
+    def backup_library(self):
+        dest = filedialog.asksaveasfilename(title='Backup DJ Tag Manager library',
+            defaultextension='.json', filetypes=[('JSON backup','*.json')])
+        if not dest: return
+        payload = {'schema':1, 'created':datetime.now(timezone.utc).isoformat(),
+            'tracks':list(self.rows), 'settings':self.serato_options,
+            'saved_views':self.saved_views, 'genre_groups':self.genre_groups}
+        Path(dest).write_text(json.dumps(payload, indent=2), encoding='utf-8')
+        messagebox.showinfo(APP_NAME, 'Library paths and preferences backed up. Music files were not copied.')
+
+    def restore_library_backup(self):
+        source = filedialog.askopenfilename(filetypes=[('JSON backup','*.json')])
+        if not source:return
+        try:
+            data = json.loads(Path(source).read_text(encoding='utf-8'))
+            if data.get('schema') != 1 or not isinstance(data.get('tracks'),list):
+                raise ValueError('Unrecognized backup format')
+            paths = data['tracks']
+            if not all(isinstance(p,str) for p in paths):
+                raise ValueError('Invalid track paths')
+        except (OSError, ValueError) as exc:
+            return messagebox.showerror(APP_NAME,f'Cannot restore backup: {exc}')
+        if not messagebox.askyesno(APP_NAME,
+            f'Restore {len(paths)} library entries? Existing library entries will be retained.'):
+            return
+        self.add_paths([p for p in paths if Path(p).is_file()])
+        for path in paths:
+            if path not in self.rows and not Path(path).exists():
+                self.rows[path] = dict(path=path,title=Path(path).stem,artist='',
+                    genre='',status='Missing file')
+                self.refresh(path)
+        self.persist_library()
+        self.update_sidebar_counts()
+
+    def relocate_missing(self):
+        selected = [p for p in self.selected() if not Path(p).is_file()]
+        if len(selected) != 1:
+            return messagebox.showinfo(APP_NAME,'Select one missing track to relocate.')
+        old = selected[0]
+        replacement = filedialog.askopenfilename(title='Locate ' + Path(old).name)
+        if not replacement:return
+        if Path(replacement).suffix.lower() not in AUDIO_EXTENSIONS:
+            return messagebox.showwarning(APP_NAME,'Choose a supported audio file.')
+        try:
+            track = read_any_track(replacement)
+        except Exception as exc:
+            return messagebox.showerror(APP_NAME,f'Could not read replacement: {exc}')
+        if Path(old).name.casefold() != Path(replacement).name.casefold():
+            if not messagebox.askyesno(APP_NAME,
+                f'The replacement filename differs from {Path(old).name}. Use it anyway?'):
+                return
+        self.tree.delete(old)
+        self.rows.pop(old)
+        replacement = str(Path(replacement).resolve())
+        track.update(status='Relocated', match='', bpm='', cues=[])
+        self.rows[replacement] = track
+        self.refresh(replacement)
+        self.persist_library()
+        self.update_sidebar_counts()
+        self.status.configure(text='Library path repaired. Serato crate references were not changed.')
+
+    def close_app(self):
+        if self.busy and not messagebox.askyesno(APP_NAME,'A task is running. Cancel it and close?'):
+            return
+        self.cancel_requested.set()
+        self.queue_engine.stop()
+        self.stop_playback()
+        self.persist_library()
+        self.save_preferences()
+        self.root.destroy()
 
     def show_popup(self, menu, button):
         self.root.update_idletasks()
@@ -567,12 +956,59 @@ class App:
         finally:
             self.settings_menu.grab_release()
 
+    def _sidebar_resize_start(self, event):
+        self._sidebar_drag_origin = (event.x_root, self.sidebar.winfo_width())
+
+    def _sidebar_resize_move(self, event):
+        if self._sidebar_drag_origin is None or self.extra_settings.get('sidebar_collapsed', False):
+            return
+        origin_x, origin_width = self._sidebar_drag_origin
+        width = max(180, min(350, origin_width + event.x_root - origin_x))
+        self.sidebar.configure(width=width)
+
+    def _sidebar_resize_end(self, event):
+        if self._sidebar_drag_origin is not None:
+            self._sidebar_resize_move(event)
+            self._sidebar_drag_origin = None
+            self.extra_settings['sidebar_width'] = self.sidebar.winfo_width()
+            self.save_preferences()
+
+    def _setup_sidebar_toggle(self):
+        self._sidebar_toggle = ttk.Button(self.sidebar, text='◀ Collapse sidebar', command=self.toggle_sidebar)
+        self._sidebar_toggle.pack(side='bottom', fill='x', padx=8, pady=10)
+        if self.extra_settings.get('sidebar_collapsed', False):
+            self.toggle_sidebar(force=True)
+
+    def toggle_sidebar(self, force=False):
+        collapsed = bool(self.extra_settings.get('sidebar_collapsed', False))
+        new_collapsed = collapsed if force else not collapsed
+        if new_collapsed:
+            self.sidebar.configure(width=54)
+            for child in self.sidebar.winfo_children():
+                if child is not self._sidebar_toggle:
+                    child.pack_forget()
+            self._sidebar_toggle.configure(text='▶')
+        else:
+            self.sidebar.configure(width=sidebar_width(self.extra_settings.get('sidebar_width', 240)))
+            # Rebuild the sidebar instead of guessing old pack positions.
+            for child in list(self.sidebar.winfo_children()):
+                if child is not self._sidebar_toggle:
+                    child.destroy()
+            active_view = self.current_view
+            self.build_sidebar()
+            self.choose_view(active_view)
+            self.add_advanced_sidebar()
+            self._build_sidebar_additions()
+            self._sidebar_toggle.configure(text='◀ Collapse sidebar')
+        self.extra_settings['sidebar_collapsed'] = new_collapsed
+        self.save_preferences()
+
     def configure_columns(self):
         self.tree.configure(displaycolumns=tuple(self.visible_columns))
         for col in COLUMN_LABELS:
             self.tree.heading(col, text='⌕  ' + COLUMN_LABELS[col] + '  ▾',
                 command=lambda c=col: self.header_search(c))
-            width = 200 if col in ('title', 'path', 'status') else 150 if col in ('artist', 'album', 'composer') else 110
+            width = self.column_widths.get(col, 200 if col in ('title', 'path', 'status') else 150 if col in ('artist', 'album', 'composer') else 110)
             self.tree.column(col, width=width, minwidth=60, stretch=True, anchor='center')
 
     def load_column_layout(self):
@@ -585,10 +1021,27 @@ class App:
         except (OSError, ValueError, TypeError, AttributeError):
             return list(DEFAULT_COLUMNS)
 
+    def load_column_widths(self):
+        try:
+            data = json.loads(self.layout_path.read_text(encoding='utf-8'))
+            return {k: max(60, min(900, int(v))) for k, v in data.get('widths', {}).items()
+                    if k in COLUMN_LABELS}
+        except (OSError, ValueError, TypeError, AttributeError):
+            return {}
+
+    def capture_column_widths(self):
+        if not hasattr(self, 'tree'):
+            return
+        for key in COLUMN_LABELS:
+            try:
+                self.column_widths[key] = int(self.tree.column(key, 'width'))
+            except (tk.TclError, ValueError):
+                pass
+
     def save_column_layout(self):
         try:
             self.layout_path.parent.mkdir(parents=True, exist_ok=True)
-            self.layout_path.write_text(json.dumps({'visible_columns': self.visible_columns}, indent=2), encoding='utf-8')
+            self.layout_path.write_text(json.dumps({'visible_columns': self.visible_columns, 'widths': self.column_widths}, indent=2), encoding='utf-8')
         except OSError as exc:
             messagebox.showwarning(APP_NAME, f'Column layout could not be saved: {exc}')
 
@@ -709,27 +1162,66 @@ class App:
         pop.lift()
 
     def header_search(self, field):
-        """Click the header search glyph to filter, or clear its existing filter."""
-        win=tk.Toplevel(self.root)
-        win.title('Filter ' + COLUMN_LABELS[field])
-        win.configure(bg=COLORS['bg'])
-        win.geometry('380x125')
-        win.transient(self.root)
-        tk.Label(win,text='Filter '+COLUMN_LABELS[field]+' (BPM: 90-100)',
-            bg=COLORS['bg'],fg=COLORS['text']).pack(anchor='w',padx=14,pady=(10,4))
-        var=tk.StringVar(value=self.filters.get(field,''))
-        entry=ttk.Entry(win,textvariable=var)
-        entry.pack(fill='x',padx=14)
+        """An inline filter floats directly over its column heading (no popup dialog)."""
+        self._last_column_search = field
+        old = getattr(self, '_inline_header_entry', None)
+        if old is not None and old.winfo_exists():
+            old.destroy()
+        if field not in self.visible_columns:
+            return
+        self.root.update_idletasks()
+        display_index = self.visible_columns.index(field)
+        x = sum(self.tree.column(c, 'width') for c in self.visible_columns[:display_index])
+        width = self.tree.column(field, 'width')
+        var = tk.StringVar(value=self.filters.get(field, ''))
+        entry = ttk.Entry(self.tree, textvariable=var)
+        self._inline_header_entry = entry
+        entry.place(x=x+2, y=2, width=max(75,width-4), height=28)
         def changed(*_):
-            value=var.get().strip()
-            if value:self.filters[field]=value
-            else:self.filters.pop(field,None)
+            value = var.get().strip()
+            if value: self.filters[field] = value
+            else: self.filters.pop(field, None)
             self.apply_filters()
-        var.trace_add('write',changed)
-        ttk.Button(win,text='Clear',command=lambda:var.set('')).pack(side='right',padx=14,pady=7)
+        var.trace_add('write', changed)
+        entry.bind('<Escape>', lambda e: (entry.destroy(), 'break')[-1])
+        entry.bind('<Return>', lambda e: (entry.destroy(), 'break')[-1])
         entry.focus_set()
+        entry.selection_range(0, 'end')
+
+    def sort_column(self, field):
+        """Cycle ascending, descending, and original import order."""
+        state = getattr(self, '_sort_state', None)
+        if state is None:
+            state = self._sort_state = {}
+        direction = (state.get(field, 0) + 1) % 3
+        state[field] = direction
+        if direction == 0:
+            paths = [p for p in self.rows if self.tree.exists(p)]
+        else:
+            def key(path):
+                raw = str(display_value(self.rows[path], field) or '').strip()
+                if field in ('bpm','bpm_tag','year','bitrate','duration'):
+                    match = re.search(r'\d+(?:\.\d+)?',raw)
+                    return (0,float(match.group())) if match else (1,0)
+                return (0,raw.casefold())
+            paths = sorted((p for p in self.rows if self.tree.exists(p)),
+                           key=key, reverse=(direction == 2))
+        for position,path in enumerate(paths):
+            if self.tree.parent(path) == '' and path in self.tree.get_children(''):
+                self.tree.move(path, '', position)
+
+    def column_header_menu(self, field, x, y):
+        menu = tk.Menu(self.root, tearoff=False, bg=COLORS['panel'], fg=COLORS['text'],
+                       activebackground=COLORS['raised'], activeforeground=COLORS['accent'])
+        menu.add_command(label='Search this column', command=lambda: self.header_search(field))
+        menu.add_command(label='Sort ascending / descending / original', command=lambda: self.sort_column(field))
+        menu.add_command(label='Clear this filter', command=lambda: (self.filters.pop(field,None),self.apply_filters()))
+        menu.tk_popup(x,y)
+        menu.grab_release()
 
     def apply_filters(self):
+        self.extra_settings['column_filters'] = dict(self.filters)
+        self.save_preferences()
         selected=set(self.tree.selection())
         for path in self.rows:
             visible=True
@@ -766,6 +1258,15 @@ class App:
         self.tree.configure(displaycolumns=tuple(self.visible_columns))
         self.save_column_layout()
 
+    def on_shift_header_sort(self, event):
+        if self.tree.identify_region(event.x,event.y) != 'heading':
+            return
+        try: index=int(self.tree.identify_column(event.x)[1:])-1
+        except (ValueError, IndexError): return
+        if 0 <= index < len(self.visible_columns):
+            self.sort_column(self.visible_columns[index])
+            return 'break'
+
     def on_header_press(self, event):
         if self.tree.identify_region(event.x, event.y) != 'heading':
             self._header_drag = None
@@ -781,6 +1282,8 @@ class App:
     def on_header_release(self, event):
         drag = self._header_drag
         self._header_drag = None
+        self.capture_column_widths()
+        self.save_column_layout()
         if drag is None or abs(event.x - drag[1]) < 12:
             return
         if self.tree.identify_region(event.x, event.y) != 'heading':
@@ -963,12 +1466,12 @@ class App:
         ttk.Button(window, text='Save API Settings', style='Accent.TButton', command=save).grid(row=5, column=1, pady=12)
 
     def add_files(self):
-        self.add_paths(filedialog.askopenfilenames(filetypes=[('MP3 files', '*.mp3')]))
+        self.add_paths(filedialog.askopenfilenames(filetypes=[('Audio files', '*.mp3 *.flac *.m4a *.aiff *.aif *.wav'), ('All files', '*.*')]))
 
     def add_folder(self):
         folder = filedialog.askdirectory()
         if folder:
-            self.add_paths(sorted(Path(folder).rglob('*.mp3')))
+            self.add_paths([folder])
 
     def on_drop(self, event):
         # Tk's splitlist handles filenames containing spaces and braces.
@@ -1089,8 +1592,8 @@ class App:
         for incoming in paths:
             incoming = Path(incoming).expanduser()
             if incoming.is_dir():
-                expanded.extend(p for p in incoming.rglob('*') if p.is_file() and p.suffix.lower() == '.mp3')
-            elif incoming.is_file() and incoming.suffix.lower() == '.mp3':
+                expanded.extend(p for p in incoming.rglob('*') if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS)
+            elif incoming.is_file() and incoming.suffix.lower() in AUDIO_EXTENSIONS:
                 expanded.append(incoming)
         newly_added = []
         for path in expanded:
@@ -1098,7 +1601,7 @@ class App:
             if path in self.rows:
                 continue
             try:
-                track = read_track(path)
+                track = read_any_track(path)
                 track.update(match='', bpm='', status='Imported', cues=[])
                 split = suggest_from_track(track)
                 if split:
@@ -1109,8 +1612,10 @@ class App:
                 self.refresh(path)
             except Exception:
                 errors += 1
-        self.status.config(text=f'{len(self.rows)} MP3s loaded. {errors} unreadable files skipped.')
-        if newly_added and (self.auto_lookup.get() or self.auto_bpm.get()):
+        self.status.config(text=f'{len(self.rows)} tracks loaded. {errors} unreadable files skipped.')
+        self.persist_library()
+        self.update_sidebar_counts()
+        if False and newly_added and (self.auto_lookup.get() or self.auto_bpm.get()):
             self.run_job('import', newly_added)
 
     def refresh(self, path):
@@ -1126,32 +1631,16 @@ class App:
         return list(self.tree.selection())
 
     def run_job(self, kind, paths=None):
-        paths = self.selected() if paths is None else paths
+        paths=self.selected() if paths is None else paths
         if not paths:
-            messagebox.showinfo(APP_NAME, 'Select one or more tracks first.')
-            return
-        if self.busy:
-            return
-        self.busy = True
-        self.cancel_requested.clear()
-        self.show_progress(kind,len(paths))
-        self.status.config(text=f'{kind}: processing {len(paths)} tracks...')
-        def work():
-            for index, path in enumerate(paths):
-                if self.cancel_requested.is_set(): break
-                self.events.put(('progress', index, len(paths), Path(path).name))
-                r = self.rows[path]
-                if kind in ('lookup', 'import') and (kind == 'lookup' or self.auto_lookup.get()):
-                    result = multi_lookup(r.get('suggested_artist') or r['artist'], r.get('suggested_title') or r['title'], self.config)
-                    self.events.put(('result', 'lookup', path, result))
-                if kind in ('analyze', 'import') and (kind == 'analyze' or self.auto_bpm.get()):
-                    result = analyze_cues(path)
-                    self.events.put(('result', 'analyze', path, result))
-            self.events.put(('done', kind, len(paths)))
-        threading.Thread(target=work, daemon=True).start()
+            return messagebox.showinfo(APP_NAME,'Select one or more tracks first.')
+        if kind not in ('lookup','analyze','lookup_analyze'):
+            return messagebox.showwarning(APP_NAME,'Unsupported queued operation')
+        job_id=self.queue_engine.add(kind,paths)
+        self.status.configure(text=f'{kind.title()} queued for {len(paths)} tracks (task #{job_id}).')
 
     def lookup(self):
-        self.run_job('lookup')
+        self.run_job('lookup_analyze')
 
     def analyze(self):
         self.run_job('analyze')
@@ -1160,6 +1649,31 @@ class App:
         try:
             while True:
                 event = self.events.get_nowait()
+                if event[0] == 'cover_art_result':
+                    _,path,art,error=event
+                    self._apply_cover_art(path,art,error)
+                    continue
+                if event[0] == 'waveform_ready':
+                    _,path,bands,duration=event
+                    self.waveform_controller.ready(path,bands,duration)
+                    continue
+                if event[0] == 'queue_progress':
+                    _,job_id,index,total=event
+                    self.status.configure(text=f'Task #{job_id}: {index}/{total} processed')
+                    continue
+                if event[0] == 'queue_skip':
+                    _,job_id,path,reason=event
+                    if path in self.rows:
+                        self.rows[path]['status']='Task skipped: '+reason[:65]
+                        self.refresh(path)
+                    continue
+                if event[0] == 'queue_done':
+                    _,job_id,kind,cancelled=event
+                    self.status.configure(text=f'Task #{job_id} {"cancelled" if cancelled else "completed"}.')
+                    continue
+                if event[0] == 'queue_result':
+                    _,job_id,kind,path,result=event
+                    event=('result',kind,path,result)
                 if event[0] == 'key_result':
                     _,path,value=event
                     if path in self.rows:
@@ -1181,12 +1695,21 @@ class App:
                 r = self.rows.get(path)
                 if not r:
                     continue
-                if result.get('error'):
+                if result.get('error') and kind != 'lookup_analyze':
                     if kind == 'lookup':
                         r['lookup_debug'] = result.get('lookup_debug', {})
                         r['lookup_warnings'] = result.get('errors', [])
                     r['status'] = result['error'][:65]
-                elif kind == 'lookup':
+                elif kind in ('lookup', 'lookup_analyze'):
+                    # Lookup + audio analysis are proposed together. Only explicit
+                    # per-track confirmation can commit to the original music file.
+                    analysis = result.get('analysis', {})
+                    lookup_result = result.get('lookup', result)
+                    result = lookup_result
+                    r['field_confidence'] = {**field_confidence(result), **analysis.get('confidence', {})}
+                    r['possible_revision'] = any(0 < v < 70 for v in r['field_confidence'].values())
+                    if analysis.get('bpm'):
+                        r['bpm'] = analysis['bpm']
                     # Stage metadata for review; the Year/Genre/Composer columns
                     # display these values immediately, but MP3s change only on Save.
                     for field in ('year', 'genre', 'subgenre'):
@@ -1204,6 +1727,10 @@ class App:
                     r['match'] = (f'{confidence}% MusicBrainz' if isinstance(confidence,(int,float)) else
                                   ('Multiple sources' if provider_count>1 else 'Review'))
                     r['status'] = 'Lookup: ' + ', '.join(result.get('sources', [])) if result.get('sources') else 'No match'
+                    if result.get('error') and analysis.get('error'):
+                        r['status'] = 'Lookup and analysis unavailable — no write'
+                    else:
+                        self._confirm_lookup_write(path, result, analysis)
                 else:
                     r['bpm'] = result['bpm']
                     if not r.get('bpm_tag'):
@@ -1215,6 +1742,108 @@ class App:
         except queue.Empty:
             pass
         self.root.after(100, self.poll)
+
+    def find_cover_art_selected(self):
+        paths=self.selected()
+        if len(paths)!=1:
+            return messagebox.showinfo('Cover Art','Select exactly one MP3 track.',parent=self.root)
+        path=paths[0]
+        if Path(path).suffix.lower()!='.mp3':
+            return messagebox.showinfo('Cover Art','Embedded cover art currently supports MP3 only.',parent=self.root)
+        r=self.rows[path]
+        if not messagebox.askyesno('Find Cover Art',
+                f'Search MusicBrainz and Cover Art Archive for {Path(path).name}?\n\n'
+                'Artwork will not be written without another confirmation.',parent=self.root):
+            return
+        # Network retrieval is off the UI thread; only the main thread opens dialogs.
+        def fetch():
+            from metadata_sources import musicbrainz
+            try:
+                match=musicbrainz(r.get('artist',''),r.get('title',''))
+                art=artwork_from_musicbrainz(match.get('recording_id')) if match else None
+                self.events.put(('cover_art_result',path,art,None))
+            except Exception as exc:
+                self.events.put(('cover_art_result',path,None,type(exc).__name__))
+        threading.Thread(target=fetch,daemon=True).start()
+        self.status.configure(text='Searching for cover art…')
+
+    def _apply_cover_art(self,path,art,error):
+        if error or not art:
+            return messagebox.showinfo('Cover Art','No usable artwork found. '+(error or ''),parent=self.root)
+        if path not in self.rows:return
+        if not messagebox.askyesno('Confirm cover art write',
+                f'Write {len(art["data"]):,} bytes of {art["mime"]} cover art to\n{Path(path).name}?\n\n'
+                'A recovery copy will be retained.',parent=self.root):
+            return
+        def writer(temp,changes,custom):
+            write_mp3_cover_art(temp,art)
+        try:
+            safe_write(path,{}, {'__cover_art__':'front'},writer,read_any_track,
+                       self.data_dir/'metadata_recovery',expected=self.rows[path].get('disk_fingerprint'))
+            self.rows[path].update(read_any_track(path))
+            self.rows[path]['status']='Cover art written in place'
+            self.rows[path]['written']=True
+            self.refresh(path);self.persist_library()
+        except Exception as exc:
+            messagebox.showerror('Cover Art Write Blocked',str(exc),parent=self.root)
+
+    def metadata_automation_settings(self):
+        win=tk.Toplevel(self.root);win.title('Metadata Automation');win.geometry('510x440')
+        body=ttk.Frame(win,padding=18);body.pack(fill='both',expand=True)
+        ttk.Label(body,text='Find Tags & Art — Write Preferences',style='Brand.TLabel').pack(anchor='w',pady=(0,12))
+        ttk.Label(body,text='Each lookup always asks before changing the audio file.').pack(anchor='w')
+        current=self.extra_settings.get('metadata_automation',{})
+        enabled=set(current.get('fields',['year','genre','bpm_tag','key']))
+        flags={}
+        for field,label in [('year','Original release year'),('genre','Genre'),('subgenre','Subgenre → Composer'),('bpm_tag','Analyzed BPM'),('key','Camelot key')]:
+            v=tk.BooleanVar(value=field in enabled);flags[field]=v
+            ttk.Checkbutton(body,text=label,variable=v).pack(anchor='w',pady=5)
+        replace=tk.BooleanVar(value=bool(current.get('replace_existing',False)))
+        ttk.Checkbutton(body,text='Propose replacement of already-filled fields',variable=replace).pack(anchor='w',pady=10)
+        ttk.Label(body,text='Artist and Title are never overwritten by automatic lookup.').pack(anchor='w')
+        def save():
+            self.extra_settings['metadata_automation']={'fields':[k for k,v in flags.items() if v.get()],
+                                                          'replace_existing':replace.get()}
+            self.save_preferences();win.destroy()
+        ttk.Button(body,text='Save Preferences',command=save,style='Accent.TButton').pack(anchor='e',pady=18)
+
+    def _confirm_lookup_write(self, path, lookup, analysis):
+        """Show a per-file overwrite prompt; all writes use recovery journal."""
+        r = self.rows.get(path)
+        if not r:
+            return
+        settings = self.extra_settings.get('metadata_automation', {})
+        enabled = settings.get('fields', ['year','genre','bpm_tag','key'])
+        # A user must explicitly opt in to Composer/subgenre replacement.
+        changes = metadata_proposal(r, lookup, analysis, fields=enabled,
+                                    replace_existing=bool(settings.get('replace_existing', False)))
+        if not changes:
+            r['status'] = 'Lookup complete — no eligible new fields'
+            return
+        lines = '\n'.join(f'{COLUMN_LABELS.get(k,k)}: {r.get(k) or "(blank)"} → {v} '
+                          f'({r.get("field_confidence",{}).get("subgenre" if k=="composer" else k, 0)}% estimated confidence)'
+                          for k,v in changes.items())
+        if not messagebox.askyesno('Confirm lookup metadata write',
+                f'{Path(path).name}\n\n{lines}\n\n'
+                'Write these fields to the actual audio file?\n'
+                'The original is backed up and can be restored from Write History.',
+                parent=self.root):
+            r['status'] = 'Lookup proposal — write declined'
+            return
+        try:
+            safe_write(path, changes, {}, write_any_tags, read_any_track,
+                       self.data_dir / 'metadata_recovery', expected=r.get('disk_fingerprint'))
+            r.update(read_any_track(path))
+            r['disk_fingerprint'] = fingerprint(path)
+            for field in ('year','genre','subgenre'):
+                r.pop('suggested_'+field,None)
+            r['status'] = 'Tags written in place'
+            r['written'] = True
+            self.undo_stack.clear(); self.redo_stack.clear()
+            self.persist_library()
+        except Exception as exc:
+            r['status'] = 'Safe write blocked: '+str(exc)[:100]
+            messagebox.showerror('Metadata write blocked',str(exc),parent=self.root)
 
     def show_details(self, _event=None):
         selected = self.selected()
@@ -1234,8 +1863,9 @@ class App:
             messagebox.showinfo(APP_NAME, 'Nothing to write. Edit tags or run a lookup first.')
             return
         if not messagebox.askyesno(APP_NAME,
-                f'Write pending metadata to {len(ready)} original MP3(s)?\n\n'
-                'No duplicate MP3 or backup will be created. These edits cannot be automatically undone.\n'
+                f'Write pending metadata to {len(ready)} music file(s)?\n\n'
+                'Each file will be backed up and verified before replacement.\n'
+                'Writes can be restored from Metadata Write History.\n'
                 'Composer will be replaced by a suggested subgenre if one is available.'):
             return
         success = 0
@@ -1260,10 +1890,13 @@ class App:
                         parent=self.root):
                         changes.pop(protected,None)
             try:
-                apply_tag_changes(path, changes, r.get('pending_custom', {}))
+                safe_write(path, changes, r.get('pending_custom', {}),
+                           write_any_tags, read_any_track, self.data_dir / 'metadata_recovery',
+                           expected=r.get('disk_fingerprint'))
                 for key in ('pending_tags', 'pending_custom', 'suggested_year', 'suggested_genre', 'suggested_subgenre', 'suggested_artist', 'suggested_title'):
                     r.pop(key, None)
-                r.update(read_track(path))
+                r.update(read_any_track(path))
+                r['disk_fingerprint'] = fingerprint(path)
                 r['status'] = 'Tags written in place'
                 success += 1
             except Exception as exc:
@@ -1271,6 +1904,49 @@ class App:
             self.refresh(path)
         self.show_details()
         self.status.config(text=f'Tags written to {success}/{len(ready)} files.')
+        if success:
+            self.undo_stack.clear()
+            self.redo_stack.clear()
+        self.persist_library()
+
+    def metadata_write_history_dialog(self):
+        """Show durable recovery copies; restore only if track has not changed."""
+        db = self.data_dir / 'metadata_recovery' / 'metadata_writes.sqlite3'
+        entries = metadata_history(db)
+        win = tk.Toplevel(self.root)
+        win.title('Metadata Write History / Restore')
+        win.geometry('850x450')
+        cols = ('date', 'track', 'state')
+        table = ttk.Treeview(win, columns=cols, show='headings', selectmode='browse')
+        for key, label, width in [('date','Written UTC',230), ('track','File',460), ('state','State',120)]:
+            table.heading(key, text=label)
+            table.column(key, width=width)
+        table.pack(fill='both', expand=True, padx=12, pady=12)
+        by_id = {}
+        for record in entries:
+            by_id[record['id']] = record
+            table.insert('', 'end', iid=record['id'], values=(record['created_utc'],
+                         Path(record['path']).name, 'Restored' if record['restored_utc'] else 'Available'))
+        def restore():
+            chosen = table.selection()
+            if not chosen: return
+            record = by_id[chosen[0]]
+            if not messagebox.askyesno('Restore metadata',
+                f"Restore the entire original audio file from its verified recovery copy?\n\n{record['path']}\n\n"
+                'This will be blocked if the file has changed since the write.', parent=win):
+                return
+            try:
+                path = restore_write(db, record['id'])
+                if path in self.rows:
+                    self.rows[path].update(read_any_track(path))
+                    self.rows[path]['status'] = 'Metadata restored'
+                    self.refresh(path)
+                self.persist_library()
+                table.set(record['id'], 'state', 'Restored')
+                messagebox.showinfo('Restore complete', 'Verified original audio restored.', parent=win)
+            except Exception as exc:
+                messagebox.showerror('Restore blocked', str(exc), parent=win)
+        ttk.Button(win, text='Restore Selected Write', command=restore).pack(pady=(0,12))
 
     def load_preferences(self):
         try:
@@ -1280,13 +1956,19 @@ class App:
         self.genre_groups=data.get('genre_groups',{})
         self.saved_views=data.get('saved_views',{})
         self.protected_fields=set(data.get('protected_fields',['publisher']))
+        self.serato_options={**SERATO_DEFAULTS, **data.get('serato',{})}
+        self.extra_settings=data.get('extra_settings',{})
+        self.advanced_filter=data.get('advanced_filter',{})
+        self.shortcut_settings=data.get('shortcuts',{})
 
     def save_preferences(self):
         try:
             self.preferences_path.parent.mkdir(parents=True,exist_ok=True)
             self.preferences_path.write_text(json.dumps({'help':self.help_enabled.get(),
                 'genre_groups':self.genre_groups,'saved_views':self.saved_views,
-                'protected_fields':sorted(self.protected_fields)},indent=2),encoding='utf-8')
+                'protected_fields':sorted(self.protected_fields), 'serato':self.serato_options,
+                'extra_settings':self.extra_settings,'advanced_filter':self.advanced_filter,
+                'shortcuts':self.shortcut_settings},indent=2),encoding='utf-8')
         except OSError as exc:messagebox.showwarning(APP_NAME,str(exc))
 
     def toggle_help(self):
