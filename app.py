@@ -593,6 +593,8 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
         self.sidebar.pack_propagate(False)
         table_frame = ttk.Frame(self.content)
         table_frame.pack(side='left', fill='both', expand=True)
+        self._library_table_frame = table_frame
+        self._genre_workspace = None
         self.tree = ttk.Treeview(table_frame, columns=tuple(COLUMN_LABELS), show='headings', selectmode='extended')
         self.table_vscroll = tk.Scrollbar(table_frame, orient='vertical', command=self.tree.yview,
             width=7, bg=COLORS['raised'], troughcolor=COLORS['bg'], relief='flat',
