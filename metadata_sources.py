@@ -59,7 +59,7 @@ def musicbrainz(artist, title):
             pass
     return {'source': 'MusicBrainz', 'year': min(years) if years else None,
             'tags': [x['name'] for x in sorted(tags, key=lambda t: t.get('count', 0), reverse=True)
-                     if x.get('name')], 'confidence': best.get('score', 0)}
+                     if x.get('name')], 'confidence': best.get('score', 0), 'recording_id': best.get('id')}
 
 def lastfm(artist,title,key):
     if not key:return None
@@ -190,4 +190,5 @@ def lookup(artist, title, config):
     return {'year': str(min(years)) if years else '', 'genre': genre, 'subgenre': subgenre,
             'sources': [r['source'] for r in results], 'errors': errors, 'tags': tags[:20],
             'score': 'Review', 'lookup_debug': debug,
+            'recording_id': next((r.get('recording_id') for r in results if r.get('recording_id')), None),
             'error': 'No matching metadata found.' if not results else None}
