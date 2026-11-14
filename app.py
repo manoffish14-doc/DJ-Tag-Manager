@@ -1,5 +1,8 @@
 """DJ Tag Manager: local macOS-friendly MP3 metadata editor."""
 import json
+import hashlib
+import copy
+import math
 import base64
 import struct
 import zlib
@@ -82,13 +85,13 @@ def apply_dark_theme(root):
                        [('Button.padding', {'sticky': 'nswe', 'children':
                          [('Button.label', {'sticky': 'nswe'})]})]})])
     style.configure('TButton', background=COLORS['raised'], foreground=COLORS['text'],
-                    borderwidth=0, padding=(13, 9), relief='flat',
-                    font=('Helvetica', 12, 'bold'))
+                    borderwidth=0, padding=(17, 12), relief='flat',
+                    font=('Helvetica', 14, 'bold'))
     style.map('TButton', background=[('pressed', COLORS['hover']),
                                      ('active', COLORS['hover'])],
               foreground=[('disabled', COLORS['muted'])])
     style.configure('Accent.TButton', background=COLORS['accent'],
-                    foreground=COLORS['bg'], padding=(15, 9))
+                    foreground=COLORS['bg'], padding=(18, 12))
     style.map('Accent.TButton', background=[('active', COLORS['accent_hover']),
                                             ('pressed', COLORS['accent_hover'])],
               foreground=[('active', COLORS['bg'])])
@@ -166,7 +169,7 @@ USER_AGENT = 'DJTagManager/0.1 (local desktop application)'
 # The column chooser controls presentation only. No ID3 data is discarded.
 COLUMN_LABELS = {
     'title': 'Title', 'artist': 'Artist', 'album': 'Album', 'album_artist': 'Album Artist',
-    'year': 'Year', 'genre': 'Genre', 'composer': 'Composer / Subgenre',
+    'year': 'Year', 'genre': 'Genre', 'composer': 'Composer',
     'track_number': 'Track #', 'disc_number': 'Disc #', 'bpm_tag': 'Tagged BPM',
     'key': 'Musical Key', 'comment': 'Comment', 'publisher': 'Publisher',
     'isrc': 'ISRC', 'copyright': 'Copyright', 'encoded_by': 'Encoded By',
@@ -410,13 +413,23 @@ def apply_tag_changes(path, changes, custom_changes):
 class App:
     def __init__(self, root):
         self.root = root
-        root.title(APP_NAME + ' 2.0')
+        root.title(APP_NAME + ' 3.0')
         root.geometry('1300x780')
         root.minsize(1050, 650)
         apply_dark_theme(root)
         self.rows = {}
         self.events = queue.Queue()
         self.busy = False
+        self.cancel_requested = threading.Event()
+        self.progress_window = None
+        self.help_enabled = tk.BooleanVar(value=False)
+        self.filters = {}
+        self.undo_stack = []
+        self.redo_stack = []
+        self.saved_views = {}
+        self.genre_groups = {}
+        self._tooltip = None
+        self._tooltip_after = None
         self.config_path = Path.home() / 'Library' / 'Application Support' / 'DJ Tag Manager' / 'api_keys.json'
         self.config = self.load_config()
         self.auto_lookup = tk.BooleanVar(value=True)
@@ -424,6 +437,8 @@ class App:
         self.save_names = tk.BooleanVar(value=False)
         self.layout_path = self.config_path.with_name('column_layout.json')
         self.visible_columns = self.load_column_layout()
+        self.preferences_path = self.config_path.with_name('v3_preferences.json')
+        self.load_preferences()
         header = ttk.Frame(root, padding=(20, 17, 20, 8))
         header.pack(fill='x')
         ttk.Label(header, text='DJ Tag Manager', style='Brand.TLabel').pack(side='left')
@@ -432,19 +447,25 @@ class App:
         # The gear is in the header, not a horizontally overflowing toolbar.
         toolbar = ttk.Frame(root, padding=(16, 8, 16, 8))
         toolbar.pack(fill='x')
+        self.toolbar_buttons = {}
         for label, cmd in [('Add Music', self.add_files), ('Add Folder', self.add_folder),
                            ('Lookup Metadata', self.lookup), ('Analyze BPM', self.analyze),
                            ('Save Changes', self.write)]:
-            ttk.Button(toolbar, text=label, command=cmd,
-                       style='Accent.TButton' if label == 'Save Changes' else 'TButton').pack(side='left', padx=3)
+            button = ttk.Button(toolbar, text=label, command=cmd,
+                       style='Accent.TButton' if label == 'Save Changes' else 'TButton')
+            button.pack(side='left', padx=4)
+            self.toolbar_buttons[label] = button
         self.more_menu = tk.Menu(root, tearoff=False, bg=COLORS['panel'], fg=COLORS['text'],
                                  activebackground=COLORS['select'], activeforeground=COLORS['accent'])
-        for label, cmd in [('Auto-Fix Title', self.suggest_split), ('View Metadata', self.all_metadata),
+        for label, cmd in [('Genre Cleanup', self.genre_cleanup), ('Find Duplicates', self.find_duplicates),
+                           ('Detect Musical Key', self.detect_keys), ('Smart Filters', self.smart_filters),
+                           ('Undo', self.undo), ('Redo', self.redo), ('Auto-Fix Title', self.suggest_split), ('View Metadata', self.all_metadata),
                            ('Edit Metadata', self.edit_all_tags), ('Show in Finder', self.reveal_selected),
                            ('Export Cue Suggestions', self.export)]:
             self.more_menu.add_command(label=label, command=cmd)
         more_button = ttk.Button(toolbar, text='More Actions  ···', command=lambda: self.show_popup(self.more_menu, more_button))
-        more_button.pack(side='left', padx=3)
+        more_button.pack(side='left', padx=4)
+        self.toolbar_buttons['More Actions'] = more_button
         # Keep configuration out of the main toolbar. Each menu item opens its
         # existing dialog or toggles a preference without modifying MP3 files.
         self.settings_menu = tk.Menu(root, tearoff=False, bg=COLORS['panel'],
@@ -452,23 +473,19 @@ class App:
                                      activeforeground=COLORS['accent'], borderwidth=0)
         self.settings_menu.add_command(label='API Settings…', command=self.settings)
         self.settings_menu.add_command(label='Genre Lookup Diagnostics…', command=self.show_lookup_debug)
-        self.settings_menu.add_command(label='Customize Columns…', command=self.choose_columns)
         self.settings_menu.add_separator()
         self.settings_menu.add_checkbutton(label='Auto lookup on import/drop', variable=self.auto_lookup)
         self.settings_menu.add_checkbutton(label='Auto BPM analysis on import/drop', variable=self.auto_bpm)
         self.settings_menu.add_checkbutton(label='Include artist/title when writing tags', variable=self.save_names)
         self.settings_button = ttk.Button(header, text='⚙ Settings', command=self.open_settings_menu)
         self.settings_button.pack(side='right', padx=(8, 0))
-        editor = ttk.Frame(root, padding=(10, 3))
-        editor.pack(fill='x')
-        ttk.Label(editor, text='Suggested artist:').pack(side='left')
-        self.artist_edit = tk.StringVar()
-        ttk.Entry(editor, textvariable=self.artist_edit, width=25).pack(side='left', padx=4)
-        ttk.Label(editor, text='Suggested title:').pack(side='left')
-        self.title_edit = tk.StringVar()
-        ttk.Entry(editor, textvariable=self.title_edit, width=37).pack(side='left', padx=4)
-        ttk.Button(editor, text='Apply to selected row', command=self.apply_split).pack(side='left', padx=4)
-        ttk.Label(editor, text='Double-click any editable tag cell').pack(side='left', padx=4)
+        self.help_button = tk.Button(header, text='?', width=3, height=1, font=('Helvetica', 17, 'bold'),
+            bg=COLORS['raised'], fg=COLORS['text'], activebackground=COLORS['accent'],
+            relief='flat', command=self.toggle_help)
+        self.help_button.pack(side='right', padx=(4, 0))
+        self.install_help()
+        if self.help_enabled.get():
+            self.help_button.configure(bg=COLORS['accent'],fg=COLORS['bg'])
         self.drop_label = ttk.Label(root, text='↓   DROP MP3 FILES OR FOLDERS HERE   •   AUTOMATIC LOOKUP ON IMPORT',
                                     anchor='center', padding=17, style='Muted.TLabel')
         self.drop_label.pack(fill='x', padx=10, pady=(3, 3))
@@ -486,8 +503,12 @@ class App:
         table_frame = ttk.Frame(root)
         table_frame.pack(fill='both', expand=True, padx=16, pady=(8, 6))
         self.tree = ttk.Treeview(table_frame, columns=tuple(COLUMN_LABELS), show='headings', selectmode='extended')
-        self.table_vscroll = ttk.Scrollbar(table_frame, orient='vertical', command=self.tree.yview)
-        self.table_hscroll = ttk.Scrollbar(table_frame, orient='horizontal', command=self.tree.xview)
+        self.table_vscroll = tk.Scrollbar(table_frame, orient='vertical', command=self.tree.yview,
+            width=7, bg=COLORS['raised'], troughcolor=COLORS['bg'], relief='flat',
+            borderwidth=0, highlightthickness=0, activebackground=COLORS['hover'])
+        self.table_hscroll = tk.Scrollbar(table_frame, orient='horizontal', command=self.tree.xview,
+            width=7, bg=COLORS['raised'], troughcolor=COLORS['bg'], relief='flat',
+            borderwidth=0, highlightthickness=0, activebackground=COLORS['hover'])
         self.tree.configure(yscrollcommand=self.table_vscroll.set, xscrollcommand=self.table_hscroll.set)
         self.table_vscroll.pack(side='right', fill='y')
         self.table_hscroll.pack(side='bottom', fill='x')
@@ -496,6 +517,12 @@ class App:
         self.tree.tag_configure('odd', background=COLORS['panel'])
         self.tree.tag_configure('even', background='#19202B')
         self.tree.bind('<<TreeviewSelect>>', self.show_details)
+        self.tree.bind('<Command-a>', self.select_all_visible)
+        self.tree.bind('<Control-a>', self.select_all_visible)
+        self.tree.bind('<Escape>', lambda e: self.tree.selection_remove(self.tree.selection()))
+        self.root.bind_all('<Command-z>', self.undo, add='+')
+        self.root.bind_all('<Command-Shift-Z>', self.redo, add='+')
+        self.root.bind_all('<Command-Shift-z>', self.redo, add='+')
         self.tree.bind('<Double-1>', self.edit_song_cell)
         self.tree.bind('<Button-2>', self.on_header_context_menu)
         self.tree.bind('<Button-3>', self.on_header_context_menu)
@@ -516,6 +543,8 @@ class App:
         self.status = ttk.Label(root, text='●  Ready  •  Add MP3s or drop a folder to begin',
                                 padding=(20, 12), style='Muted.TLabel')
         self.status.pack(fill='x')
+        self.selection_status = ttk.Label(root, text='0 of 0 tracks selected', style='Muted.TLabel')
+        self.selection_status.pack(anchor='e', padx=20, pady=(0, 4))
         root.after(100, self.poll)
 
     def show_popup(self, menu, button):
@@ -538,7 +567,8 @@ class App:
     def configure_columns(self):
         self.tree.configure(displaycolumns=tuple(self.visible_columns))
         for col in COLUMN_LABELS:
-            self.tree.heading(col, text=COLUMN_LABELS[col])
+            self.tree.heading(col, text='⌕  ' + COLUMN_LABELS[col] + '  ▾',
+                command=lambda c=col: self.header_search(c))
             width = 200 if col in ('title', 'path', 'status') else 150 if col in ('artist', 'album', 'composer') else 110
             self.tree.column(col, width=width, minwidth=60, stretch=True, anchor='center')
 
@@ -644,17 +674,82 @@ class App:
         render()
 
     def on_header_context_menu(self, event):
-        """Show the visibility checklist only when right-clicking a column header."""
         if self.tree.identify_region(event.x, event.y) != 'heading':
             return
-        menu = tk.Menu(self.tree, tearoff=False, bg=COLORS['panel'],
-                       fg=COLORS['text'], activebackground=COLORS['select'],
-                       activeforeground=COLORS['accent'])
-        menu.add_command(label='Customize Columns…', command=self.choose_columns)
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
+        self.column_dropdown(event.x_root, event.y_root)
+        return 'break'
+
+    def column_dropdown(self, x=None, y=None):
+        """Immediate, persistent two-column visibility chooser anchored to header."""
+        if getattr(self, '_column_popup', None) and self._column_popup.winfo_exists():
+            self._column_popup.destroy()
+        pop = tk.Toplevel(self.root)
+        self._column_popup = pop
+        pop.overrideredirect(True)
+        pop.configure(bg=COLORS['line'])
+        pop.geometry(f'+{x or self.tree.winfo_rootx()}+{y or self.tree.winfo_rooty()}')
+        body = tk.Frame(pop, bg=COLORS['panel'], padx=10, pady=10)
+        body.pack(padx=1, pady=1)
+        tk.Label(body, text='VISIBLE COLUMNS    (click to toggle)', bg=COLORS['panel'],
+            fg=COLORS['accent'], font=('Helvetica', 12, 'bold')).grid(row=0,column=0,columnspan=2,sticky='w',pady=(0,8))
+        for i,(key,label) in enumerate(COLUMN_LABELS.items()):
+            var=tk.BooleanVar(value=key in self.visible_columns)
+            def toggle(k=key):
+                self.toggle_column(k)
+            cb=tk.Checkbutton(body,text=label,variable=var,command=toggle,
+                bg=COLORS['panel'],fg=COLORS['text'],selectcolor=COLORS['raised'],
+                activebackground=COLORS['panel'],activeforeground=COLORS['accent'],
+                font=('Helvetica',12),anchor='w',indicatoron=True)
+            cb.grid(row=1+i%14,column=i//14,sticky='ew',padx=8,pady=3)
+        tk.Button(body,text='Close ×',command=pop.destroy,bg=COLORS['raised'],fg=COLORS['text'],
+            relief='flat').grid(row=16,column=0,columnspan=2,sticky='ew',pady=(8,0))
+        pop.lift()
+
+    def header_search(self, field):
+        """Click the header search glyph to filter, or clear its existing filter."""
+        win=tk.Toplevel(self.root)
+        win.title('Filter ' + COLUMN_LABELS[field])
+        win.configure(bg=COLORS['bg'])
+        win.geometry('380x125')
+        win.transient(self.root)
+        tk.Label(win,text='Filter '+COLUMN_LABELS[field]+' (BPM: 90-100)',
+            bg=COLORS['bg'],fg=COLORS['text']).pack(anchor='w',padx=14,pady=(10,4))
+        var=tk.StringVar(value=self.filters.get(field,''))
+        entry=ttk.Entry(win,textvariable=var)
+        entry.pack(fill='x',padx=14)
+        def changed(*_):
+            value=var.get().strip()
+            if value:self.filters[field]=value
+            else:self.filters.pop(field,None)
+            self.apply_filters()
+        var.trace_add('write',changed)
+        ttk.Button(win,text='Clear',command=lambda:var.set('')).pack(side='right',padx=14,pady=7)
+        entry.focus_set()
+
+    def apply_filters(self):
+        selected=set(self.tree.selection())
+        for path in self.rows:
+            visible=True
+            for field,term in self.filters.items():
+                value=str(display_value(self.rows[path],field))
+                if field in ('bpm','bpm_tag') and re.fullmatch(r'\d+\s*-\s*\d+',term):
+                    lo,hi=map(float,term.split('-'))
+                    try: visible=lo<=float(value)<=hi
+                    except ValueError:visible=False
+                else: visible=term.casefold() in value.casefold()
+                if not visible:break
+            if visible and self.tree.exists(path) and not self.tree.parent(path) and path not in self.tree.get_children(''):
+                self.tree.move(path,'','end')
+            elif visible and not self.tree.exists(path):
+                self.refresh(path)
+            elif not visible and self.tree.exists(path):
+                self.tree.detach(path)
+        self.show_details()
+
+    def select_all_visible(self,event=None):
+        if isinstance(self.root.focus_get(),(tk.Entry,ttk.Entry,tk.Text)):
+            return
+        self.tree.selection_set(self.tree.get_children(''))
         return 'break'
 
     def toggle_column(self, key):
@@ -812,6 +907,7 @@ class App:
             add_custom(name, value)
         ttk.Button(body, text='+ Add Custom Text Tag', command=add_custom).pack(anchor='w', pady=8)
         def stage():
+            self.push_undo()
             pending = row.setdefault('pending_tags', {})
             for field, var in vars_.items():
                 original = row.get(field, '')
@@ -961,7 +1057,11 @@ class App:
             editor.destroy()
             if save:
                 row = self.rows[path]
-                row.setdefault('pending_tags', {})[field] = new_text
+                self.push_undo()
+                if new_text == str(row.get(field,'')):
+                    row.setdefault('pending_tags',{}).pop(field,None)
+                else:
+                    row.setdefault('pending_tags', {})[field] = new_text
                 if field in ('title', 'artist'):
                     row['suggested_' + field] = new_text
                     self.save_names.set(True)
@@ -1012,7 +1112,7 @@ class App:
 
     def refresh(self, path):
         r = self.rows[path]
-        values = tuple(display_value(r, c) for c in COLUMN_LABELS)
+        values = tuple(('●  ' if c=='title' and (r.get('pending_tags') or r.get('pending_custom')) else '') + str(display_value(r,c)) for c in COLUMN_LABELS)
         if self.tree.exists(path):
             self.tree.item(path, values=values)
         else:
@@ -1030,9 +1130,13 @@ class App:
         if self.busy:
             return
         self.busy = True
+        self.cancel_requested.clear()
+        self.show_progress(kind,len(paths))
         self.status.config(text=f'{kind}: processing {len(paths)} tracks...')
         def work():
             for index, path in enumerate(paths):
+                if self.cancel_requested.is_set(): break
+                self.events.put(('progress', index, len(paths), Path(path).name))
                 r = self.rows[path]
                 if kind in ('lookup', 'import') and (kind == 'lookup' or self.auto_lookup.get()):
                     result = multi_lookup(r.get('suggested_artist') or r['artist'], r.get('suggested_title') or r['title'], self.config)
@@ -1053,8 +1157,21 @@ class App:
         try:
             while True:
                 event = self.events.get_nowait()
+                if event[0] == 'key_result':
+                    _,path,value=event
+                    if path in self.rows:
+                        if not value.startswith('Error:'):
+                            self.rows[path].setdefault('pending_tags',{})['key']=value
+                            self.rows[path]['status']='Key estimated — pending save'
+                        else:self.rows[path]['status']=value
+                        self.refresh(path)
+                    continue
+                if event[0] == 'progress':
+                    self.update_progress(*event[1:])
+                    continue
                 if event[0] == 'done':
                     self.busy = False
+                    self.close_progress()
                     self.status.config(text=f'{event[1].title()} finished: {event[2]} tracks.')
                     continue
                 _, kind, path, result = event
@@ -1079,7 +1196,10 @@ class App:
                     r['lookup_debug'] = result.get('lookup_debug', {})
                     r['sources'] = result.get('sources', [])
                     r['lookup_warnings'] = result.get('errors', [])
-                    r['match'] = str(result.get('score', ''))
+                    provider_count=len(result.get('sources',[]))
+                    confidence=result.get('lookup_debug',{}).get('providers',{}).get('MusicBrainz',{}).get('confidence')
+                    r['match'] = (f'{confidence}% MusicBrainz' if isinstance(confidence,(int,float)) else
+                                  ('Multiple sources' if provider_count>1 else 'Review'))
                     r['status'] = 'Lookup: ' + ', '.join(result.get('sources', [])) if result.get('sources') else 'No match'
                 else:
                     r['bpm'] = result['bpm']
@@ -1096,10 +1216,10 @@ class App:
     def show_details(self, _event=None):
         selected = self.selected()
         self.details.delete('1.0', 'end')
+        if hasattr(self,'selection_status'):
+            self.selection_status.configure(text=f'{len(selected)} of {len(self.tree.get_children())} visible tracks selected')
         if selected:
             r = self.rows[selected[0]]
-            self.artist_edit.set(r.get('suggested_artist', r.get('artist', '')))
-            self.title_edit.set(r.get('suggested_title', r.get('title', '')))
             self.details.insert('end', json.dumps({k:v for k,v in r.items() if k != 'duration'}, indent=2))
 
     def write(self):
@@ -1130,6 +1250,12 @@ class App:
                     if 'suggested_' + field in r:
                         changes[field] = r['suggested_' + field]
             changes.update(r.get('pending_tags', {}))  # Manual edits always win over lookup suggestions.
+            for protected in self.protected_fields:
+                if protected in changes and r.get(protected) and changes[protected] != r[protected]:
+                    if not messagebox.askyesno(APP_NAME,
+                        f'Protected field {COLUMN_LABELS.get(protected,protected)} on {Path(path).name} already has a value. Overwrite?',
+                        parent=self.root):
+                        changes.pop(protected,None)
             try:
                 apply_tag_changes(path, changes, r.get('pending_custom', {}))
                 for key in ('pending_tags', 'pending_custom', 'suggested_year', 'suggested_genre', 'suggested_subgenre', 'suggested_artist', 'suggested_title'):
@@ -1142,6 +1268,264 @@ class App:
             self.refresh(path)
         self.show_details()
         self.status.config(text=f'Tags written to {success}/{len(ready)} files.')
+
+    def load_preferences(self):
+        try:
+            data=json.loads(self.preferences_path.read_text(encoding='utf-8'))
+        except (OSError,ValueError):data={}
+        self.help_enabled.set(bool(data.get('help',False)))
+        self.genre_groups=data.get('genre_groups',{})
+        self.saved_views=data.get('saved_views',{})
+        self.protected_fields=set(data.get('protected_fields',['publisher']))
+
+    def save_preferences(self):
+        try:
+            self.preferences_path.parent.mkdir(parents=True,exist_ok=True)
+            self.preferences_path.write_text(json.dumps({'help':self.help_enabled.get(),
+                'genre_groups':self.genre_groups,'saved_views':self.saved_views,
+                'protected_fields':sorted(self.protected_fields)},indent=2),encoding='utf-8')
+        except OSError as exc:messagebox.showwarning(APP_NAME,str(exc))
+
+    def toggle_help(self):
+        self.help_enabled.set(not self.help_enabled.get())
+        self.help_button.configure(bg=COLORS['accent'] if self.help_enabled.get() else COLORS['raised'],
+            fg=COLORS['bg'] if self.help_enabled.get() else COLORS['text'])
+        self.save_preferences()
+
+    def install_help(self):
+        explanations={'Add Music':'Import individual MP3 files.','Add Folder':'Import MP3s from a folder.',
+            'Lookup Metadata':'Search MusicBrainz, Last.fm, Discogs and optional Spotify.',
+            'Analyze BPM':'Analyze BPM for selected tracks.','Save Changes':'Write pending edits to original MP3s.',
+            'More Actions':'Genre Cleanup, duplicates, keys and other tools.'}
+        for name,widget in self.toolbar_buttons.items():
+            widget.bind('<Enter>',lambda e,n=name:self.help_hover(e,explanations[n]))
+            widget.bind('<Leave>',self.help_leave)
+
+    def help_hover(self,event,description):
+        if not self.help_enabled.get():return
+        self.help_leave()
+        widget=event.widget
+        def show():
+            if not self.help_enabled.get():return
+            tip=tk.Toplevel(self.root)
+            tip.overrideredirect(True)
+            tip.configure(bg=COLORS['accent'])
+            tip.geometry(f'+{widget.winfo_rootx()}+{widget.winfo_rooty()+widget.winfo_height()+7}')
+            tk.Label(tip,text=description,bg=COLORS['panel'],fg=COLORS['text'],
+                padx=12,pady=9,font=('Helvetica',12)).pack(padx=1,pady=1)
+            self._tooltip=tip
+        self._tooltip_after=self.root.after(500,show)
+
+    def help_leave(self,event=None):
+        if self._tooltip_after:
+            self.root.after_cancel(self._tooltip_after)
+            self._tooltip_after=None
+        if self._tooltip and self._tooltip.winfo_exists():self._tooltip.destroy()
+        self._tooltip=None
+
+    def push_undo(self):
+        self.undo_stack.append({p:(copy.deepcopy(r.get('pending_tags',{})),
+            copy.deepcopy(r.get('pending_custom',{}))) for p,r in self.rows.items()})
+        if len(self.undo_stack)>40:self.undo_stack.pop(0)
+        self.redo_stack.clear()
+
+    def restore_edit_state(self,state):
+        for p,(tags,custom) in state.items():
+            if p in self.rows:
+                self.rows[p]['pending_tags']=copy.deepcopy(tags)
+                self.rows[p]['pending_custom']=copy.deepcopy(custom)
+                self.refresh(p)
+        self.show_details()
+
+    def undo(self,event=None):
+        if isinstance(self.root.focus_get(),(tk.Entry,ttk.Entry,tk.Text)):return
+        if self.undo_stack:
+            self.redo_stack.append({p:(copy.deepcopy(r.get('pending_tags',{})),
+                copy.deepcopy(r.get('pending_custom',{}))) for p,r in self.rows.items()})
+            self.restore_edit_state(self.undo_stack.pop())
+        return 'break'
+
+    def redo(self,event=None):
+        if isinstance(self.root.focus_get(),(tk.Entry,ttk.Entry,tk.Text)):return
+        if self.redo_stack:
+            self.undo_stack.append({p:(copy.deepcopy(r.get('pending_tags',{})),
+                copy.deepcopy(r.get('pending_custom',{}))) for p,r in self.rows.items()})
+            self.restore_edit_state(self.redo_stack.pop())
+        return 'break'
+
+    def show_progress(self,kind,total):
+        win=tk.Toplevel(self.root)
+        self.progress_window=win
+        win.title('Processing Music')
+        win.configure(bg=COLORS['panel'])
+        win.geometry('440x220')
+        win.resizable(False,False)
+        win.transient(self.root)
+        win.grab_set()
+        self.root.update_idletasks()
+        x=self.root.winfo_rootx()+(self.root.winfo_width()-440)//2
+        y=self.root.winfo_rooty()+(self.root.winfo_height()-220)//2
+        win.geometry(f'+{max(0,x)}+{max(0,y)}')
+        tk.Label(win,text='Processing '+kind.title(),bg=COLORS['panel'],fg=COLORS['accent'],
+            font=('Helvetica',18,'bold')).pack(pady=(23,10))
+        self.progress_text=tk.StringVar(value=f'0 of {total} tracks')
+        ttk.Label(win,textvariable=self.progress_text).pack(pady=6)
+        self.progress_bar=ttk.Progressbar(win,maximum=max(total,1),length=365,mode='determinate')
+        self.progress_bar.pack(pady=8)
+        ttk.Label(win,text='Click × to cancel remaining tracks safely.').pack(pady=7)
+        def cancel():
+            self.cancel_requested.set()
+            self.progress_text.set('Cancel requested — finishing current track…')
+        win.protocol('WM_DELETE_WINDOW',cancel)
+        tk.Button(win,text='×',command=cancel,bg=COLORS['raised'],fg=COLORS['text'],
+            relief='flat',font=('Helvetica',15,'bold')).place(x=402,y=8,width=29,height=29)
+
+    def update_progress(self,index,total,name):
+        if self.progress_window and self.progress_window.winfo_exists():
+            self.progress_bar.configure(value=index)
+            self.progress_text.set(f'{index} of {total} tracks  •  {name[:45]}')
+
+    def close_progress(self):
+        win=self.progress_window
+        self.progress_window=None
+        if win and win.winfo_exists():
+            try:win.grab_release()
+            except tk.TclError:pass
+            win.destroy()
+
+    def smart_filters(self):
+        win=tk.Toplevel(self.root);win.title('Smart Filters');win.geometry('420x330')
+        win.configure(bg=COLORS['bg'])
+        ttk.Label(win,text='Saved Filter Views',style='Brand.TLabel').pack(pady=12)
+        name=tk.StringVar()
+        ttk.Entry(win,textvariable=name).pack(fill='x',padx=15)
+        box=tk.Listbox(win,bg=COLORS['panel'],fg=COLORS['text'])
+        box.pack(fill='both',expand=True,padx=15,pady=10)
+        def redraw():
+            box.delete(0,'end')
+            for k in sorted(self.saved_views):box.insert('end',k)
+        def save():
+            if name.get().strip():
+                self.saved_views[name.get().strip()]=dict(self.filters)
+                self.save_preferences();redraw()
+        def load():
+            if box.curselection():
+                self.filters=dict(self.saved_views[box.get(box.curselection()[0])]);self.apply_filters();win.destroy()
+        def clear():self.filters.clear();self.apply_filters()
+        bar=ttk.Frame(win);bar.pack(pady=8)
+        for title,fn in [('Save View',save),('Load View',load),('Clear Filters',clear)]:
+            ttk.Button(bar,text=title,command=fn).pack(side='left',padx=3)
+        redraw()
+
+    def find_duplicates(self):
+        groups={}
+        for p,r in self.rows.items():
+            key=(re.sub(r'\W+','',r.get('artist','').casefold()),
+                re.sub(r'\W+','',r.get('title','').casefold()))
+            if all(key):groups.setdefault(key,[]).append(p)
+        matches=[v for v in groups.values() if len(v)>1]
+        win=tk.Toplevel(self.root);win.title('Possible Duplicates — no files deleted')
+        win.geometry('780x470')
+        txt=tk.Text(win,bg=COLORS['panel'],fg=COLORS['text'],font=('Menlo',11))
+        txt.pack(fill='both',expand=True)
+        for group in matches:
+            txt.insert('end','POSSIBLE DUPLICATES:\n'+'\n'.join(group)+'\n\n')
+        if not matches:txt.insert('end','No matching artist/title pairs found in loaded tracks.')
+        txt.configure(state='disabled')
+
+    def detect_keys(self):
+        paths=self.selected()
+        if not paths:return messagebox.showinfo(APP_NAME,'Select tracks first.')
+        if self.busy:return
+        self.busy=True;self.cancel_requested.clear();self.show_progress('key detection',len(paths))
+        def worker():
+            for i,path in enumerate(paths):
+                if self.cancel_requested.is_set():break
+                self.events.put(('progress',i,len(paths),Path(path).name))
+                try:
+                    import librosa,numpy as np
+                    y,sr=librosa.load(path,sr=11025,mono=True)
+                    chroma=librosa.feature.chroma_stft(y=y,sr=sr)
+                    profile=np.mean(chroma,axis=1)
+                    major=np.array([6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88])
+                    minor=np.array([6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17])
+                    candidates=[(float(np.corrcoef(profile,np.roll(t,i))[0,1]),i,mode)
+                        for mode,t in [('major',major),('minor',minor)] for i in range(12)]
+                    score,note,mode=max(candidates)
+                    names=['C','C#','D','D#','E','F','F#','G','G#','A','A#','B']
+                    camelot_major=['8B','3B','10B','5B','12B','7B','2B','9B','4B','11B','6B','1B']
+                    camelot_minor=['5A','12A','7A','2A','9A','4A','11A','6A','1A','8A','3A','10A']
+                    value=f'{names[note]} {mode} ({(camelot_major if mode=="major" else camelot_minor)[note]})'
+                    self.events.put(('key_result',path,value))
+                except Exception as exc:self.events.put(('key_result',path,'Error: '+str(exc)[:70]))
+            self.events.put(('done','key detection',len(paths)))
+        threading.Thread(target=worker,daemon=True).start()
+
+    def genre_cleanup(self):
+        """Manual genre cleanup. Group names write to Label/TPUB only on explicit Save."""
+        win=tk.Toplevel(self.root);win.title('Genre Cleanup');win.geometry('860x650')
+        win.configure(bg=COLORS['bg'])
+        ttk.Label(win,text='Genre Cleanup — Manual Changes Only',style='Brand.TLabel').pack(pady=12)
+        ttk.Label(win,text='Select a genre, rename it, and assign a grouping (Label). Nothing changes until Save.').pack(pady=4)
+        genres={}
+        for path,row in self.rows.items():
+            genre=str(display_value(row,'genre')).strip()
+            if genre:genres.setdefault(genre,[]).append(path)
+        container=ttk.Frame(win);container.pack(fill='both',expand=True,padx=15,pady=10)
+        listbox=tk.Listbox(container,bg=COLORS['panel'],fg=COLORS['text'],font=('Helvetica',13))
+        listbox.pack(side='left',fill='both',expand=True)
+        right=ttk.Frame(container);right.pack(side='left',fill='y',padx=15)
+        rename=tk.StringVar();group=tk.StringVar()
+        ttk.Label(right,text='Genre name').pack(anchor='w')
+        ttk.Entry(right,textvariable=rename,width=28).pack(pady=(3,12))
+        ttk.Label(right,text='Grouping (stored as Label)').pack(anchor='w')
+        ttk.Entry(right,textvariable=group,width=28).pack(pady=3)
+        ttk.Label(right,text='Create a grouping by typing its name.').pack(pady=8)
+        pending={}
+        keys=sorted(genres,key=str.casefold)
+        def redraw():
+            listbox.delete(0,'end')
+            for k in keys:
+                n,g=pending.get(k,(k,self.genre_groups.get(k,'')))
+                listbox.insert('end',f'{k} ({len(genres[k])})   →   {n}  [{g or "No group"}]')
+        def selection(_=None):
+            if not listbox.curselection():return
+            key=keys[listbox.curselection()[0]]
+            n,g=pending.get(key,(key,self.genre_groups.get(key,'')))
+            rename.set(n);group.set(g)
+        def stage():
+            if not listbox.curselection():return
+            key=keys[listbox.curselection()[0]]
+            if not rename.get().strip():return messagebox.showwarning(APP_NAME,'Genre cannot be empty.',parent=win)
+            pending[key]=(rename.get().strip(),group.get().strip());redraw()
+        def save():
+            stage()
+            changes=[];conflicts=[]
+            for old,(new,grouping) in pending.items():
+                for path in genres[old]:
+                    row=self.rows[path]
+                    if grouping and row.get('publisher') and row['publisher']!=grouping:
+                        conflicts.append(path)
+                    changes.append((path,new,grouping))
+            if conflicts and not messagebox.askyesno(APP_NAME,
+                f'{len(set(conflicts))} tracks already have a record label. Replace that Label with the genre grouping?',parent=win):return
+            if not changes:return win.destroy()
+            self.push_undo()
+            for path,new,grouping in changes:
+                row=self.rows[path]
+                row.setdefault('pending_tags',{})['genre']=new
+                if grouping:row['pending_tags']['publisher']=grouping
+                row['status']='Genre Cleanup — pending save'
+                self.refresh(path)
+            for old,(new,grouping) in pending.items():
+                if grouping:self.genre_groups[new]=grouping
+            self.save_preferences()
+            win.destroy()
+            messagebox.showinfo(APP_NAME,f'{len(set(p for p,_,_ in changes))} tracks staged. Click Save Changes to write MP3s.')
+        listbox.bind('<<ListboxSelect>>',selection)
+        ttk.Button(right,text='Rename / Assign',command=stage).pack(fill='x',pady=10)
+        ttk.Button(right,text='Save Cleanup',style='Accent.TButton',command=save).pack(fill='x')
+        redraw()
 
     def export(self):
         paths = [p for p in self.selected() if self.rows[p].get('cues')]
