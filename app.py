@@ -1,5 +1,6 @@
 """DJ Tag Manager: local macOS-friendly MP3 metadata editor."""
 import json
+import subprocess
 import re
 import shutil
 from datetime import datetime
@@ -11,7 +12,8 @@ from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
 
 import requests
-from mutagen.id3 import ID3, ID3NoHeaderError, TDRC, TCON, TIT2, TPE1
+from mutagen.id3 import ID3, ID3NoHeaderError, TDRC, TCON, TIT2, TPE1, TCOM, TXXX, COMM, Frames
+from metadata_sources import lookup as multi_lookup
 from mutagen.mp3 import MP3
 
 try:
@@ -24,28 +26,127 @@ APP_NAME = 'DJ Tag Manager'
 USER_AGENT = 'DJTagManager/0.1 (local desktop application)'
 
 
+
+# The column chooser controls presentation only. No ID3 data is discarded.
+COLUMN_LABELS = {
+    'title': 'Title', 'artist': 'Artist', 'album': 'Album', 'album_artist': 'Album Artist',
+    'year': 'Year', 'genre': 'Genre', 'composer': 'Composer / Subgenre',
+    'track_number': 'Track #', 'disc_number': 'Disc #', 'bpm_tag': 'Tagged BPM',
+    'key': 'Musical Key', 'comment': 'Comment', 'publisher': 'Publisher',
+    'isrc': 'ISRC', 'copyright': 'Copyright', 'encoded_by': 'Encoded By',
+    'duration_display': 'Duration', 'bitrate': 'Bitrate', 'sample_rate': 'Sample Rate',
+    'filename': 'Filename', 'folder': 'Folder', 'path': 'File Path', 'match': 'Match',
+    'bpm': 'Analyzed BPM', 'status': 'Status', 'suggested_year': 'Suggested Year',
+    'suggested_genre': 'Suggested Genre', 'suggested_subgenre': 'Suggested Subgenre',
+    'sources_display': 'Lookup Sources',
+}
+DEFAULT_COLUMNS = ('title', 'artist', 'year', 'genre', 'composer', 'match', 'bpm', 'status')
+ID3_TEXT_FIELDS = {
+    'album': 'TALB', 'album_artist': 'TPE2', 'track_number': 'TRCK',
+    'disc_number': 'TPOS', 'bpm_tag': 'TBPM', 'key': 'TKEY',
+    'publisher': 'TPUB', 'isrc': 'TSRC', 'copyright': 'TCOP', 'encoded_by': 'TENC',
+    'title': 'TIT2', 'artist': 'TPE1', 'year': 'TDRC', 'genre': 'TCON', 'composer': 'TCOM',
+}
+
+
+def inspect_metadata(path):
+    """Return every ID3 frame in a human-readable, non-destructive view."""
+    tags = ID3(path)
+    entries = []
+    for frame in tags.values():
+        frame_id = getattr(frame, 'FrameID', type(frame).__name__)
+        frame_key = getattr(frame, 'HashKey', frame_id)
+        if hasattr(frame, 'text'):
+            value = ' / '.join(str(v) for v in frame.text)
+        elif frame_id in ('APIC', 'GEOB', 'PRIV'):
+            payload = getattr(frame, 'data', b'')
+            value = f'[Binary data: {len(payload):,} bytes]'
+            desc = getattr(frame, 'desc', '')
+            if desc:
+                value += f' Description: {desc}'
+            owner = getattr(frame, 'owner', '')
+            if owner:
+                value += f' Owner: {owner}'
+        elif frame_id == 'COMM':
+            value = ' / '.join(str(v) for v in frame.text)
+        elif frame_id == 'USLT':
+            value = str(getattr(frame, 'text', ''))
+        else:
+            value = str(frame)
+            if len(value) > 800:
+                value = value[:800] + '… [truncated in viewer]'
+        entries.append((str(frame_key), str(value)))
+    return sorted(entries, key=lambda item: item[0])
+
+
+def display_value(row, column):
+    if column in row.get('pending_tags', {}):
+        return row['pending_tags'][column]
+    if column in ('title', 'artist'):
+        return row.get('suggested_' + column, row.get(column, ''))
+    if column == 'sources_display':
+        return ', '.join(row.get('sources', []))
+    if column == 'filename':
+        return Path(row['path']).name
+    if column == 'folder':
+        return str(Path(row['path']).parent)
+    return row.get(column, '')
+
 def read_track(path):
     audio = MP3(path)
     tags = audio.tags
     def value(key):
         frames = tags.getall(key) if tags else []
         return str(frames[0].text[0]) if frames else ''
-    return {'path': str(path), 'title': value('TIT2') or Path(path).stem,
+    comment_frames = tags.getall('COMM') if tags else []
+    comment = ' / '.join(str(v) for v in comment_frames[0].text) if comment_frames else ''
+    duration = audio.info.length
+    extras = {name: value(frame_id) for name, frame_id in ID3_TEXT_FIELDS.items()}
+    extras.update(comment=comment, filename=Path(path).name,
+                  duration_display=f'{int(duration // 60)}:{int(duration % 60):02d}',
+                  bitrate=f'{round(audio.info.bitrate / 1000)} kbps',
+                  sample_rate=f'{audio.info.sample_rate} Hz')
+    return dict(extras, **{'path': str(path), 'title': value('TIT2') or Path(path).stem,
             'artist': value('TPE1'), 'year': value('TDRC') or value('TYER'),
-            'genre': value('TCON'), 'duration': audio.info.length}
+            'genre': value('TCON'), 'composer': value('TCOM'), 'duration': duration})
 
 
 def split_artist_title(raw):
-    """Conservative suggestions for common YouTube title patterns."""
-    text = re.sub(r'\s+', ' ', raw or '').strip()
-    text = re.sub(r'^(?:\[?official(?: music)? video\]?\s*[-:]+\s*)', '', text, flags=re.I)
-    # Split only on separators that are unlikely to be part of a name.
+    """Extract likely artist and title from noisy YouTube ID3 title text.
+
+    Suggestions only: never modifies files or removes the original title.
+    """
+    text = re.sub(r"\s+", " ", raw or "").strip()
+    # Remove common YouTube decorations wherever they occur, including
+    # '(Official HD Video)' before a featured-artist suffix.
+    text = re.sub(
+        r"\s*[\[(][^\])]*(?:official|music video|lyric video|lyrics?|visuali[sz]er|audio|4k video|hd video)[^\])]*[\])]",
+        " ", text, flags=re.I)
+    text = re.sub(r"\s*\|\s*(?:official|lyrics?|audio|music video|hd|4k)\b.*$", "", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip(' -–—|')
     for separator in (' - ', ' – ', ' — ', ' | '):
-        if separator in text:
-            artist, title = text.split(separator, 1)
-            artist, title = artist.strip(), title.strip()
-            if artist and title and len(artist) <= 100:
-                return artist, title
+        if separator not in text:
+            continue
+        artist, title = (part.strip() for part in text.split(separator, 1))
+        if not artist or not title or len(artist) > 100:
+            continue
+        # Preserve featured artist in its own suggestion while searching
+        # the base song title. Remove trailing YouTube download counters.
+        title = re.sub(r"\s+(?:ft\.?|feat\.?|featuring)\s+.+$", "", title, flags=re.I)
+        title = re.sub(r"\s+\d{1,2}$", "", title)
+        title = re.sub(r"\s+", " ", title).strip(' -–—|')
+        if title:
+            return artist, title
+    return None
+
+
+def suggest_from_track(track):
+    """Use the ID3 title first, falling back to the filename when needed."""
+    candidates = [track.get('title', ''), Path(track['path']).stem]
+    for candidate in candidates:
+        split = split_artist_title(candidate)
+        if split:
+            return split
     return None
 
 
@@ -113,7 +214,7 @@ def analyze_cues(path):
         return {'error': str(exc)}
 
 
-def write_tags(path, year, genre, artist=None, title=None):
+def write_tags(path, year, genre, artist=None, title=None, subgenre=None):
     try:
         tags = ID3(path)
     except ID3NoHeaderError:
@@ -122,6 +223,8 @@ def write_tags(path, year, genre, artist=None, title=None):
         tags.setall('TDRC', [TDRC(encoding=3, text=[year])])
     if genre:
         tags.setall('TCON', [TCON(encoding=3, text=[genre])])
+    if subgenre:
+        tags.setall('TCOM', [TCOM(encoding=3, text=[subgenre])])
     if artist is not None:
         tags.setall('TPE1', [TPE1(encoding=3, text=[artist])])
     if title is not None:
@@ -129,21 +232,65 @@ def write_tags(path, year, genre, artist=None, title=None):
     tags.save(path, v2_version=3)
 
 
+
+# Only text frames are editable. Never overwrite artwork, Serato GEOB/PRIV,
+# or other binary/proprietary frames via the generic metadata editor.
+EDITABLE_FIELDS = {k: v for k, v in ID3_TEXT_FIELDS.items()}
+EDITABLE_FIELDS['comment'] = 'COMM'
+
+def stage_frame(tags, field, value):
+    frame_id = EDITABLE_FIELDS.get(field)
+    if frame_id is None:
+        raise ValueError('This field is not a supported editable text tag')
+    if frame_id == 'COMM':
+        tags.delall('COMM')
+        if value:
+            tags.add(COMM(encoding=3, lang='eng', desc='', text=[value]))
+    else:
+        frame_type = Frames[frame_id]
+        tags.delall(frame_id)
+        if value:
+            tags.add(frame_type(encoding=3, text=[value]))
+
+def apply_tag_changes(path, changes, custom_changes):
+    try:
+        tags = ID3(path)
+    except ID3NoHeaderError:
+        tags = ID3()
+    for field, value in changes.items():
+        stage_frame(tags, field, value)
+    for description, value in custom_changes.items():
+        if not description.strip():
+            continue
+        tags.delall('TXXX:' + description)
+        if value:
+            tags.add(TXXX(encoding=3, desc=description, text=[value]))
+    tags.save(path, v2_version=3)
+
 class App:
     def __init__(self, root):
         self.root = root
-        root.title(APP_NAME + ' 0.2')
+        root.title(APP_NAME + ' 1.0')
         root.geometry('1040x650')
         self.rows = {}
         self.events = queue.Queue()
         self.busy = False
+        self.config_path = Path.home() / 'Library' / 'Application Support' / 'DJ Tag Manager' / 'api_keys.json'
+        self.config = self.load_config()
+        self.auto_lookup = tk.BooleanVar(value=True)
+        self.layout_path = self.config_path.with_name('column_layout.json')
+        self.visible_columns = self.load_column_layout()
         toolbar = ttk.Frame(root, padding=10)
         toolbar.pack(fill='x')
         for label, cmd in [('Add MP3s', self.add_files), ('Add Folder', self.add_folder),
-                           ('Lookup Selected', self.lookup), ('Analyze Cues', self.analyze),
+                           ('Lookup Selected', self.lookup), ('API Settings', self.settings), ('Analyze Cues', self.analyze),
                            ('Write Selected Tags', self.write), ('Export Cue Suggestions', self.export)]:
             ttk.Button(toolbar, text=label, command=cmd).pack(side='left', padx=3)
         ttk.Button(toolbar, text='Suggest Artist / Title', command=self.suggest_split).pack(side='left', padx=3)
+        ttk.Button(toolbar, text='Choose Columns', command=self.choose_columns).pack(side='left', padx=3)
+        ttk.Button(toolbar, text='All Metadata', command=self.all_metadata).pack(side='left', padx=3)
+        ttk.Button(toolbar, text='Edit All Tags', command=self.edit_all_tags).pack(side='left', padx=3)
+        ttk.Button(toolbar, text='Show in Finder', command=self.reveal_selected).pack(side='left', padx=3)
         editor = ttk.Frame(root, padding=(10, 3))
         editor.pack(fill='x')
         ttk.Label(editor, text='Suggested artist:').pack(side='left')
@@ -153,8 +300,10 @@ class App:
         self.title_edit = tk.StringVar()
         ttk.Entry(editor, textvariable=self.title_edit, width=37).pack(side='left', padx=4)
         ttk.Button(editor, text='Apply to selected row', command=self.apply_split).pack(side='left', padx=4)
+        ttk.Label(editor, text='Double-click any editable tag cell').pack(side='left', padx=4)
         self.save_names = tk.BooleanVar(value=False)
         ttk.Checkbutton(editor, text='Also write artist/title to MP3', variable=self.save_names).pack(side='left')
+        ttk.Checkbutton(editor, text='Auto lookup on import/drop', variable=self.auto_lookup).pack(side='left', padx=5)
         self.drop_label = ttk.Label(root, text='Drop MP3 files or folders here (or onto the song list)',
                                     anchor='center', padding=14, relief='groove')
         self.drop_label.pack(fill='x', padx=10, pady=(3, 3))
@@ -169,14 +318,12 @@ class App:
                 print(f'Drag-and-drop unavailable: {exc}')
         if not self.dnd_available:
             self.drop_label.config(text='Drag and drop unavailable in this build; use Add MP3s / Add Folder')
-        columns = ('title', 'artist', 'year', 'genre', 'match', 'bpm', 'status')
-        self.tree = ttk.Treeview(root, columns=columns, show='headings', selectmode='extended')
-        widths = (210, 160, 70, 130, 70, 65, 200)
-        for col, width in zip(columns, widths):
-            self.tree.heading(col, text=col.title())
-            self.tree.column(col, width=width, minwidth=50)
+        self.tree = ttk.Treeview(root, columns=tuple(COLUMN_LABELS), show='headings', selectmode='extended')
+        self.configure_columns()
         self.tree.pack(fill='both', expand=True, padx=10, pady=5)
         self.tree.bind('<<TreeviewSelect>>', self.show_details)
+        self.tree.bind('<Double-1>', self.edit_song_cell)
+        self.inline_editor = None
         if self.dnd_available and hasattr(self.tree, 'drop_target_register'):
             try:
                 self.tree.drop_target_register(DND_FILES)
@@ -188,6 +335,241 @@ class App:
         self.status = ttk.Label(root, text='Ready. Add MP3s or a folder.', padding=10)
         self.status.pack(fill='x')
         root.after(100, self.poll)
+
+    def configure_columns(self):
+        self.tree.configure(displaycolumns=tuple(self.visible_columns))
+        for col in COLUMN_LABELS:
+            self.tree.heading(col, text=COLUMN_LABELS[col])
+            width = 200 if col in ('title', 'path', 'status') else 150 if col in ('artist', 'album', 'composer') else 110
+            self.tree.column(col, width=width, minwidth=60, stretch=True)
+
+    def load_column_layout(self):
+        """Restore column visibility/order, ignoring fields removed by upgrades."""
+        try:
+            saved = json.loads(self.layout_path.read_text(encoding='utf-8'))
+            fields = saved.get('visible_columns', [])
+            valid = list(dict.fromkeys(key for key in fields if key in COLUMN_LABELS))
+            return valid or list(DEFAULT_COLUMNS)
+        except (OSError, ValueError, TypeError, AttributeError):
+            return list(DEFAULT_COLUMNS)
+
+    def save_column_layout(self):
+        try:
+            self.layout_path.parent.mkdir(parents=True, exist_ok=True)
+            self.layout_path.write_text(json.dumps({'visible_columns': self.visible_columns}, indent=2), encoding='utf-8')
+        except OSError as exc:
+            messagebox.showwarning(APP_NAME, f'Column layout could not be saved: {exc}')
+
+    def choose_columns(self):
+        """Choose and reorder visible columns without modifying any MP3 tags."""
+        window = tk.Toplevel(self.root)
+        window.title('Customize Song List Columns')
+        window.geometry('560x610')
+        ttk.Label(window, text='Check fields to display. Select a field and use Up / Down to change its position. Hidden tags are never deleted.',
+                  wraplength=520).pack(anchor='w', padx=12, pady=10)
+        outer = ttk.Frame(window, padding=10)
+        outer.pack(fill='both', expand=True)
+        ordered = list(self.visible_columns) + [key for key in COLUMN_LABELS if key not in self.visible_columns]
+        checked = {key: key in self.visible_columns for key in COLUMN_LABELS}
+        listbox = tk.Listbox(outer, selectmode='browse', exportselection=False)
+        scrollbar = ttk.Scrollbar(outer, orient='vertical', command=listbox.yview)
+        listbox.configure(yscrollcommand=scrollbar.set)
+        listbox.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='left', fill='y')
+        def render(selected=None):
+            listbox.delete(0, 'end')
+            for key in ordered:
+                listbox.insert('end', ('☑  ' if checked[key] else '☐  ') + COLUMN_LABELS[key])
+            if selected in ordered:
+                index = ordered.index(selected)
+                listbox.selection_set(index)
+                listbox.see(index)
+        def current():
+            selection = listbox.curselection()
+            return ordered[selection[0]] if selection else None
+        def toggle():
+            key = current()
+            if key:
+                checked[key] = not checked[key]
+                render(key)
+        def move(delta):
+            key = current()
+            if key is None: return
+            index = ordered.index(key)
+            new_index = index + delta
+            if 0 <= new_index < len(ordered):
+                ordered[index], ordered[new_index] = ordered[new_index], ordered[index]
+                render(key)
+        controls = ttk.Frame(outer, padding=(12, 0))
+        controls.pack(side='left', fill='y')
+        ttk.Button(controls, text='Show / Hide', command=toggle).pack(fill='x', pady=4)
+        ttk.Button(controls, text='Move Up', command=lambda: move(-1)).pack(fill='x', pady=4)
+        ttk.Button(controls, text='Move Down', command=lambda: move(1)).pack(fill='x', pady=4)
+        ttk.Button(controls, text='Show All', command=lambda: (checked.update({k: True for k in checked}), render(current()))).pack(fill='x', pady=(22,4))
+        ttk.Button(controls, text='Hide All', command=lambda: (checked.update({k: False for k in checked}), render(current()))).pack(fill='x', pady=4)
+        ttk.Button(controls, text='DJ Defaults', command=lambda: (checked.update({k: k in DEFAULT_COLUMNS for k in checked}), ordered.__setitem__(slice(None), list(DEFAULT_COLUMNS) + [k for k in COLUMN_LABELS if k not in DEFAULT_COLUMNS]), render())).pack(fill='x', pady=(22,4))
+        listbox.bind('<Double-1>', lambda event: toggle())
+        listbox.bind('<space>', lambda event: (toggle(), 'break')[1])
+        render()
+        def apply():
+            chosen = [key for key in ordered if checked[key]]
+            if not chosen:
+                messagebox.showwarning(APP_NAME, 'Select at least one visible column.', parent=window)
+                return
+            self.visible_columns = chosen
+            self.configure_columns()
+            self.save_column_layout()
+            window.destroy()
+        footer = ttk.Frame(window, padding=12)
+        footer.pack(fill='x')
+        ttk.Button(footer, text='Cancel', command=window.destroy).pack(side='right', padx=5)
+        ttk.Button(footer, text='Apply & Save Layout', command=apply).pack(side='right', padx=5)
+
+    def all_metadata(self):
+        """Show all existing ID3 frames, including nonstandard Serato frames, read-only."""
+        paths = self.selected()
+        if len(paths) != 1:
+            messagebox.showinfo(APP_NAME, 'Select exactly one MP3 to inspect all its metadata.')
+            return
+        path = paths[0]
+        window = tk.Toplevel(self.root)
+        window.title('All Metadata — ' + Path(path).name)
+        window.geometry('850x590')
+        ttk.Label(window, text='Full file location: ' + path, wraplength=810).pack(anchor='w', padx=10, pady=5)
+        ttk.Label(window, text='Existing MP3 tags. Edit text tags with Edit All Tags; binary artwork and Serato frames are protected.',
+                  wraplength=810).pack(anchor='w', padx=10, pady=8)
+        table = ttk.Treeview(window, columns=('frame', 'value'), show='headings')
+        table.heading('frame', text='ID3 Frame / Identifier')
+        table.heading('value', text='Current Value')
+        table.column('frame', width=240, stretch=False)
+        table.column('value', width=570)
+        scroll = ttk.Scrollbar(window, orient='vertical', command=table.yview)
+        table.configure(yscrollcommand=scroll.set)
+        scroll.pack(side='right', fill='y')
+        table.pack(fill='both', expand=True, padx=10, pady=5)
+        try:
+            entries = inspect_metadata(path)
+            for frame, value in entries:
+                table.insert('', 'end', values=(frame, value))
+        except (OSError, ValueError) as exc:
+            messagebox.showerror(APP_NAME, f'Could not read metadata: {exc}', parent=window)
+        def copy_selected():
+            items = table.selection()
+            if items:
+                data = '\n'.join('\t'.join(map(str, table.item(item, 'values'))) for item in items)
+                window.clipboard_clear()
+                window.clipboard_append(data)
+        ttk.Button(window, text='Copy Selected Metadata', command=copy_selected).pack(pady=8)
+
+    def reveal_selected(self):
+        paths = self.selected()
+        if not paths:
+            messagebox.showinfo(APP_NAME, 'Select one or more songs first.')
+            return
+        for path in paths:
+            subprocess.run(['open', '-R', path], check=False)
+
+    def edit_all_tags(self):
+        paths = self.selected()
+        if len(paths) != 1:
+            messagebox.showinfo(APP_NAME, 'Select exactly one song to edit its metadata.')
+            return
+        path = paths[0]
+        row = self.rows[path]
+        window = tk.Toplevel(self.root)
+        window.title('Edit Metadata — ' + Path(path).name)
+        window.geometry('700x680')
+        ttk.Label(window, text='File: ' + path, wraplength=660).pack(anchor='w', padx=12, pady=8)
+        ttk.Label(window, text='Changes are staged until Write Selected Tags. Empty values clear tags. Binary/Serato frames remain read-only.', wraplength=660).pack(anchor='w', padx=12)
+        canvas = tk.Canvas(window, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(window, orient='vertical', command=canvas.yview)
+        body = ttk.Frame(canvas)
+        body.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.create_window((0, 0), window=body, anchor='nw')
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side='left', fill='both', expand=True, padx=12, pady=8)
+        scrollbar.pack(side='right', fill='y')
+        vars_ = {}
+        for field in EDITABLE_FIELDS:
+            line = ttk.Frame(body)
+            line.pack(fill='x', pady=3)
+            ttk.Label(line, text=COLUMN_LABELS.get(field, field), width=22).pack(side='left')
+            initial = row.get('pending_tags', {}).get(field, row.get('suggested_' + field, row.get(field, '')))
+            var = tk.StringVar(value=initial)
+            ttk.Entry(line, textvariable=var, width=58).pack(side='left', fill='x', expand=True)
+            vars_[field] = var
+        ttk.Separator(body).pack(fill='x', pady=12)
+        ttk.Label(body, text='Custom text tags (TXXX) — add or edit').pack(anchor='w')
+        custom = {}
+        try:
+            tags = ID3(path)
+            for frame in tags.getall('TXXX'):
+                custom[frame.desc] = ' / '.join(map(str, frame.text))
+        except ID3NoHeaderError:
+            pass
+        custom.update(row.get('pending_custom', {}))
+        custom_rows = []
+        def add_custom(name='', value=''):
+            line = ttk.Frame(body)
+            line.pack(fill='x', pady=3)
+            name_var = tk.StringVar(value=name)
+            value_var = tk.StringVar(value=value)
+            ttk.Entry(line, textvariable=name_var, width=22).pack(side='left', padx=(0, 6))
+            ttk.Entry(line, textvariable=value_var, width=48).pack(side='left', fill='x', expand=True)
+            custom_rows.append((name_var, value_var))
+        for name, value in sorted(custom.items()):
+            add_custom(name, value)
+        ttk.Button(body, text='+ Add Custom Text Tag', command=add_custom).pack(anchor='w', pady=8)
+        def stage():
+            pending = row.setdefault('pending_tags', {})
+            for field, var in vars_.items():
+                original = row.get(field, '')
+                value = var.get().strip()
+                if value != original:
+                    pending[field] = value
+                else:
+                    pending.pop(field, None)
+                if field in ('artist', 'title') and field in pending:
+                    row['suggested_' + field] = value
+                    self.save_names.set(True)
+            updates = {}
+            for name_var, value_var in custom_rows:
+                name = name_var.get().strip()
+                if name:
+                    updates[name] = value_var.get().strip()
+            row['pending_custom'] = {k: v for k, v in updates.items() if custom.get(k) != v}
+            row['status'] = 'Metadata edits staged — click Write Selected Tags'
+            self.refresh(path)
+            self.show_details()
+            window.destroy()
+        ttk.Button(body, text='Stage Changes', command=stage).pack(anchor='w', pady=12)
+
+    def load_config(self):
+        try:
+            return json.loads(self.config_path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return {}
+
+    def settings(self):
+        window = tk.Toplevel(self.root)
+        window.title('Music Database API Settings')
+        window.geometry('560x300')
+        fields = [('lastfm', 'Last.fm API key'), ('discogs', 'Discogs personal access token'),
+                  ('spotify_id', 'Spotify client ID'), ('spotify_secret', 'Spotify client secret')]
+        entries = {}
+        for i, (key, label) in enumerate(fields):
+            ttk.Label(window, text=label).grid(row=i, column=0, padx=10, pady=12, sticky='w')
+            var = tk.StringVar(value=self.config.get(key, ''))
+            ttk.Entry(window, textvariable=var, width=43, show='*' if key in ('lastfm','discogs','spotify_secret') else '').grid(row=i, column=1, padx=10)
+            entries[key] = var
+        ttk.Label(window, text='Keys are stored locally in your user Application Support folder. Do not share them.').grid(row=4, column=0, columnspan=2, padx=10, pady=6)
+        def save():
+            self.config = {key: var.get().strip() for key,var in entries.items()}
+            self.config_path.parent.mkdir(parents=True, exist_ok=True)
+            self.config_path.write_text(json.dumps(self.config), encoding='utf-8')
+            self.config_path.chmod(0o600)
+            window.destroy()
+        ttk.Button(window, text='Save API Settings', command=save).grid(row=5, column=1, pady=12)
 
     def add_files(self):
         self.add_paths(filedialog.askopenfilenames(filetypes=[('MP3 files', '*.mp3')]))
@@ -210,7 +592,7 @@ class App:
         count = 0
         for path in paths:
             r = self.rows[path]
-            split = split_artist_title(r.get('title', ''))
+            split = suggest_from_track(r)
             if split:
                 r['suggested_artist'], r['suggested_title'] = split
                 r['status'] = 'Artist/title suggestion ready'
@@ -231,8 +613,61 @@ class App:
         r = self.rows[paths[0]]
         r['suggested_artist'], r['suggested_title'] = artist, title
         r['status'] = 'Edited artist/title suggestion ready'
+        self.save_names.set(True)
         self.refresh(paths[0])
         self.show_details()
+
+    def edit_song_cell(self, event):
+        """Double-click a Title or Artist cell to edit its proposed tag."""
+        region = self.tree.identify('region', event.x, event.y)
+        column = self.tree.identify_column(event.x)
+        path = self.tree.identify_row(event.y)
+        if region != 'cell' or not path:
+            return
+        index = int(column[1:]) - 1
+        displayed = self.visible_columns
+        if index < 0 or index >= len(displayed) or displayed[index] not in EDITABLE_FIELDS:
+            return
+        field = displayed[index]
+        key = 'suggested_' + field if field in ('title', 'artist') else field
+        row = self.rows[path]
+        if self.inline_editor is not None:
+            self.inline_editor.destroy()
+            self.inline_editor = None
+        bbox = self.tree.bbox(path, column)
+        if not bbox:
+            return
+        x, y, width, height = bbox
+        entry = ttk.Entry(self.tree)
+        entry.insert(0, row.get('pending_tags', {}).get(field, row.get(key, row.get(field, ''))))
+        entry.place(x=x, y=y, width=width, height=height)
+        entry.focus_set()
+        entry.select_range(0, tk.END)
+        self.inline_editor = entry
+        finished = [False]
+
+        def finish(save):
+            if finished[0]:
+                return
+            finished[0] = True
+            new_text = entry.get().strip()
+            entry.destroy()
+            if self.inline_editor is entry:
+                self.inline_editor = None
+            if not save:
+                return
+            row.setdefault('pending_tags', {})[field] = new_text
+            if field in ('title', 'artist'):
+                row[key] = new_text
+                self.save_names.set(True)
+            row['status'] = f'Edited {field} — pending save'
+            self.refresh(path)
+            self.tree.selection_set(path)
+            self.show_details()
+
+        entry.bind('<Return>', lambda e: finish(True))
+        entry.bind('<Escape>', lambda e: finish(False))
+        entry.bind('<FocusOut>', lambda e: finish(True))
 
     def add_paths(self, paths):
         errors = 0
@@ -243,6 +678,7 @@ class App:
                 expanded.extend(p for p in incoming.rglob('*') if p.is_file() and p.suffix.lower() == '.mp3')
             elif incoming.is_file() and incoming.suffix.lower() == '.mp3':
                 expanded.append(incoming)
+        newly_added = []
         for path in expanded:
             path = str(path.resolve())
             if path in self.rows:
@@ -250,15 +686,22 @@ class App:
             try:
                 track = read_track(path)
                 track.update(match='', bpm='', status='Imported', cues=[])
+                split = suggest_from_track(track)
+                if split:
+                    track['suggested_artist'], track['suggested_title'] = split
+                    track['status'] = 'Artist/title suggestion ready — review'
                 self.rows[path] = track
+                newly_added.append(path)
                 self.refresh(path)
             except Exception:
                 errors += 1
         self.status.config(text=f'{len(self.rows)} MP3s loaded. {errors} unreadable files skipped.')
+        if newly_added and self.auto_lookup.get():
+            self.run_job('lookup', newly_added)
 
     def refresh(self, path):
         r = self.rows[path]
-        values = tuple(r.get(c, '') for c in ('title', 'artist', 'year', 'genre', 'match', 'bpm', 'status'))
+        values = tuple(display_value(r, c) for c in COLUMN_LABELS)
         if self.tree.exists(path):
             self.tree.item(path, values=values)
         else:
@@ -267,8 +710,8 @@ class App:
     def selected(self):
         return list(self.tree.selection())
 
-    def run_job(self, kind):
-        paths = self.selected()
+    def run_job(self, kind, paths=None):
+        paths = self.selected() if paths is None else paths
         if not paths:
             messagebox.showinfo(APP_NAME, 'Select one or more tracks first.')
             return
@@ -280,9 +723,7 @@ class App:
             for index, path in enumerate(paths):
                 r = self.rows[path]
                 if kind == 'lookup':
-                    result = lookup_musicbrainz(r.get('suggested_artist') or r['artist'], r.get('suggested_title') or r['title'])
-                    if index < len(paths)-1:
-                        time.sleep(1.1)  # MusicBrainz public API rate limit
+                    result = multi_lookup(r.get('suggested_artist') or r['artist'], r.get('suggested_title') or r['title'], self.config)
                 else:
                     result = analyze_cues(path)
                 self.events.put(('result', kind, path, result))
@@ -307,13 +748,16 @@ class App:
                 r = self.rows.get(path)
                 if not r:
                     continue
-                if 'error' in result:
+                if result.get('error'):
                     r['status'] = result['error'][:65]
                 elif kind == 'lookup':
                     r['suggested_year'] = result['year']
                     r['suggested_genre'] = result['genre']
+                    r['suggested_subgenre'] = result['subgenre']
+                    r['sources'] = result['sources']
+                    r['lookup_warnings'] = result['errors']
                     r['match'] = str(result['score'])
-                    r['status'] = 'Lookup ready — review before writing'
+                    r['status'] = 'Lookup: ' + ', '.join(result['sources']) if result['sources'] else 'No match'
                 else:
                     r['bpm'] = result['bpm']
                     r['cues'] = result['cues']
@@ -335,29 +779,43 @@ class App:
 
     def write(self):
         paths = self.selected()
-        ready = [p for p in paths if any(k in self.rows[p] for k in ('suggested_year', 'suggested_genre'))
-                 or (self.save_names.get() and all(k in self.rows[p] for k in ('suggested_artist', 'suggested_title')))]
+        ready = [p for p in paths if self.rows[p].get('pending_tags') or self.rows[p].get('pending_custom')
+                 or any(self.rows[p].get(k) for k in ('suggested_year', 'suggested_genre', 'suggested_subgenre'))
+                 or (self.save_names.get() and any(k in self.rows[p] for k in ('suggested_artist', 'suggested_title')))]
         if not ready:
-            messagebox.showinfo(APP_NAME, 'Nothing to write. Run lookup or suggest artist/title first.')
+            messagebox.showinfo(APP_NAME, 'Nothing to write. Edit tags or run a lookup first.')
             return
-        names = self.save_names.get()
         if not messagebox.askyesno(APP_NAME,
-                f'Write suggested year/genre' + (' and artist/title' if names else '') +
-                f' directly to {len(ready)} original MP3(s)?\n\nNo duplicate MP3 or backup will be created. These edits cannot be automatically undone.'):
+                f'Write pending metadata to {len(ready)} original MP3(s)?\n\n'
+                'No duplicate MP3 or backup will be created. These edits cannot be automatically undone.\n'
+                'Composer will be replaced by a suggested subgenre if one is available.'):
             return
         success = 0
         for path in ready:
             r = self.rows[path]
+            changes = {}
+            if r.get('suggested_year'):
+                changes['year'] = r['suggested_year']
+            if r.get('suggested_genre'):
+                changes['genre'] = r['suggested_genre']
+            if r.get('suggested_subgenre'):
+                changes['composer'] = r['suggested_subgenre']
+            if self.save_names.get():
+                for field in ('artist', 'title'):
+                    if 'suggested_' + field in r:
+                        changes[field] = r['suggested_' + field]
+            changes.update(r.get('pending_tags', {}))  # Manual edits always win over lookup suggestions.
             try:
-                artist = r.get('suggested_artist') if names else None
-                title = r.get('suggested_title') if names else None
-                write_tags(path, r.get('suggested_year', ''), r.get('suggested_genre', ''), artist, title)
+                apply_tag_changes(path, changes, r.get('pending_custom', {}))
+                for key in ('pending_tags', 'pending_custom', 'suggested_year', 'suggested_genre', 'suggested_subgenre', 'suggested_artist', 'suggested_title'):
+                    r.pop(key, None)
                 r.update(read_track(path))
                 r['status'] = 'Tags written in place'
                 success += 1
             except Exception as exc:
                 r['status'] = f'Write failed: {exc}'
             self.refresh(path)
+        self.show_details()
         self.status.config(text=f'Tags written to {success}/{len(ready)} files.')
 
     def export(self):
