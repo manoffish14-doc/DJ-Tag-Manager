@@ -20,6 +20,7 @@ from pathlib import Path
 import requests
 from mutagen.id3 import ID3, ID3NoHeaderError, TDRC, TCON, TIT2, TPE1, TCOM, TXXX, COMM, Frames
 from metadata_sources import lookup as multi_lookup
+from update_manager import show_update_dialog
 from mutagen.mp3 import MP3
 
 try:
@@ -471,6 +472,8 @@ class App:
         self.settings_menu = tk.Menu(root, tearoff=False, bg=COLORS['panel'],
                                      fg=COLORS['text'], activebackground=COLORS['select'],
                                      activeforeground=COLORS['accent'], borderwidth=0)
+        self.settings_menu.add_command(label='Check for Updates…', command=lambda: show_update_dialog(self.root))
+        self.settings_menu.add_separator()
         self.settings_menu.add_command(label='API Settings…', command=self.settings)
         self.settings_menu.add_command(label='Genre Lookup Diagnostics…', command=self.show_lookup_debug)
         self.settings_menu.add_separator()
