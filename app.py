@@ -158,11 +158,16 @@ class App:
         self.drop_label = ttk.Label(root, text='Drop MP3 files or folders here (or onto the song list)',
                                     anchor='center', padding=14, relief='groove')
         self.drop_label.pack(fill='x', padx=10, pady=(3, 3))
+        self.dnd_available = False
         if DND_FILES and hasattr(root, 'drop_target_register'):
-            for target in (root, self.drop_label):
-                target.drop_target_register(DND_FILES)
-                target.dnd_bind('<<Drop>>', self.on_drop)
-        else:
+            try:
+                for target in (root, self.drop_label):
+                    target.drop_target_register(DND_FILES)
+                    target.dnd_bind('<<Drop>>', self.on_drop)
+                self.dnd_available = True
+            except tk.TclError as exc:
+                print(f'Drag-and-drop unavailable: {exc}')
+        if not self.dnd_available:
             self.drop_label.config(text='Drag and drop unavailable in this build; use Add MP3s / Add Folder')
         columns = ('title', 'artist', 'year', 'genre', 'match', 'bpm', 'status')
         self.tree = ttk.Treeview(root, columns=columns, show='headings', selectmode='extended')
@@ -172,9 +177,12 @@ class App:
             self.tree.column(col, width=width, minwidth=50)
         self.tree.pack(fill='both', expand=True, padx=10, pady=5)
         self.tree.bind('<<TreeviewSelect>>', self.show_details)
-        if DND_FILES and hasattr(self.tree, 'drop_target_register'):
-            self.tree.drop_target_register(DND_FILES)
-            self.tree.dnd_bind('<<Drop>>', self.on_drop)
+        if self.dnd_available and hasattr(self.tree, 'drop_target_register'):
+            try:
+                self.tree.drop_target_register(DND_FILES)
+                self.tree.dnd_bind('<<Drop>>', self.on_drop)
+            except tk.TclError as exc:
+                print(f'Song-list drag-and-drop unavailable: {exc}')
         self.details = tk.Text(root, height=9, wrap='word')
         self.details.pack(fill='x', padx=10, pady=5)
         self.status = ttk.Label(root, text='Ready. Add MP3s or a folder.', padding=10)
@@ -365,6 +373,13 @@ class App:
 
 
 if __name__ == '__main__':
-    root = tk.Tk()
+    if TkinterDnD is not None:
+        try:
+            root = TkinterDnD.Tk()
+        except (tk.TclError, RuntimeError, OSError) as exc:
+            print(f'Native drag-and-drop could not initialize: {exc}')
+            root = tk.Tk()
+    else:
+        root = tk.Tk()
     App(root)
     root.mainloop()
