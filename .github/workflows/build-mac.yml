@@ -26,13 +26,14 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Build Mac application
+       - name: Build Mac application
         run: |
           pyinstaller --noconfirm --clean \
             --windowed \
             --name "DJ Tag Manager" \
             --target-arch arm64 \
             --collect-all librosa \
+            --collect-all tkinterdnd2 \
             app.py
 
       
