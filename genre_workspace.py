@@ -1,22 +1,41 @@
-"""In-window genre organization and deliberate, recoverable metadata edits."""
+"""Lexicon-style vertical genre families with immediate, recoverable bulk writes."""
 from collections import defaultdict
 from pathlib import Path
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, simpledialog
 
 DEFAULT_GROUPS = ('Hip Hop', 'R&B', 'Pop', 'Classic Rock', 'Rock', 'African', 'Other')
+SUGGESTED = {
+    'Hip Hop': ('Hip-Hop', 'Rap', 'Trap', 'Boom Bap', 'Drill', 'Old School Hip Hop'),
+    'R&B': ('R&B', 'Contemporary R&B', 'Neo Soul', 'Soul', 'New Jack Swing'),
+    'Pop': ('Pop', 'Dance Pop', 'Synth Pop', 'Electropop'),
+    'Classic Rock': ('Classic Rock', 'Southern Rock', 'Psychedelic Rock'),
+    'Rock': ('Alternative Rock', 'Hard Rock', 'Indie Rock', 'Punk Rock'),
+    'African': ('Afrobeats', 'Afro House', 'Amapiano', 'Highlife'),
+    'Other': ('Dancehall', 'Reggae', 'Latin', 'Country'),
+}
 
 
 def inventory(rows, custom=()):
-    result = defaultdict(list)
+    found = defaultdict(list)
     for path, row in rows.items():
-        name = str(row.get('genre') or '').strip()
-        if name:
-            result[name].append(path)
+        genre = str(row.get('genre') or '').strip()
+        if genre:
+            found[genre].append(path)
     for name in (*DEFAULT_GROUPS, *custom):
-        if name:
-            result.setdefault(name, [])
-    return dict(result)
+        found.setdefault(name, [])
+    return dict(found)
+
+
+def plan_genre_writes(rows, assignments):
+    """Pure plan: {subgenre: parent} -> {path: metadata}, preserving the original genre."""
+    planned = {}
+    for path, row in rows.items():
+        original = str(row.get('genre') or '').strip()
+        parent = assignments.get(original)
+        if parent and original != parent:
+            planned[path] = {'genre': parent, 'composer': original}
+    return planned
 
 
 def open_genre_workspace(app):
@@ -24,9 +43,9 @@ def open_genre_workspace(app):
     from app import read_any_track, write_any_tags
     from metadata_safety import safe_write
 
-    if getattr(app, '_genre_workspace', None) is not None:
-        if app._genre_workspace.winfo_exists():
-            return
+    existing = getattr(app, '_genre_workspace', None)
+    if existing is not None and existing.winfo_exists():
+        return
     table = app._library_table_frame
     table.pack_forget()
     host = ttk.Frame(app.content)
@@ -35,173 +54,150 @@ def open_genre_workspace(app):
     organization = app.extra_settings.setdefault('genre_organization', {})
     custom_groups = app.extra_settings.setdefault('genre_custom_groups', [])
     custom_genres = app.extra_settings.setdefault('genre_custom_genres', [])
-    selected_group = tk.StringVar(value='All Genres')
+    # Seed the familiar families without changing any track metadata.
+    for group, names in SUGGESTED.items():
+        for name in names:
+            organization.setdefault(name, group)
     query = tk.StringVar()
-    destination = tk.StringVar(value='Other')
-    replacement = tk.StringVar()
-    preserve = tk.BooleanVar(value=False)
-    status = tk.StringVar(value='Select one or more genres to see affected tracks.')
-    palette = {'bg': '#15171B', 'fg': '#F2F3F5', 'select': '#48412A'}
+    status = tk.StringVar(value='Select a genre family or individual subgenres, then Save Changes.')
+    chosen = set()  # (parent, subgenre); selection is independent of file writes
+    family_widgets = {}
+    dark, panel, fg, yellow = '#15171B', '#22252B', '#F2F3F5', '#FACC15'
 
     def close():
         host.destroy()
         app._genre_workspace = None
         table.pack(side='left', fill='both', expand=True)
 
-    head = ttk.Frame(host, padding=(12, 10))
-    head.pack(fill='x')
-    ttk.Label(head, text='Genre Cleanup', font=('Helvetica', 20, 'bold')).pack(side='left')
-    ttk.Button(head, text='Back to Library', command=close).pack(side='right')
-    ttk.Label(host, text='Organize genres without modifying audio files. Confirm before changing MP3 tags.', style='Muted.TLabel').pack(anchor='w', padx=14)
-    searchbar = ttk.Frame(host, padding=(12, 10))
-    searchbar.pack(fill='x')
-    ttk.Label(searchbar, text='Search genres').pack(side='left', padx=(0, 8))
-    ttk.Entry(searchbar, textvariable=query).pack(side='left', fill='x', expand=True)
+    header = ttk.Frame(host, padding=(12, 10))
+    header.pack(fill='x')
+    ttk.Label(header, text='Genre Cleanup', font=('Helvetica', 20, 'bold')).pack(side='left')
+    ttk.Button(header, text='Back to Library', command=close).pack(side='right')
+    toolbar = ttk.Frame(host, padding=(12, 4))
+    toolbar.pack(fill='x')
+    ttk.Label(toolbar, text='Search').pack(side='left', padx=(0, 6))
+    ttk.Entry(toolbar, textvariable=query, width=24).pack(side='left')
 
-    columns = ttk.Frame(host, padding=(10, 2))
-    columns.pack(fill='both', expand=True)
-    groups_frame = ttk.Frame(columns)
-    groups_frame.pack(side='left', fill='both', expand=False, padx=5)
-    genres_frame = ttk.Frame(columns)
-    genres_frame.pack(side='left', fill='both', expand=True, padx=5)
-    tracks_frame = ttk.Frame(columns)
-    tracks_frame.pack(side='left', fill='both', expand=True, padx=5)
-    ttk.Label(groups_frame, text='Groups').pack(anchor='w')
-    ttk.Label(genres_frame, text='Genres (multi-select)').pack(anchor='w')
-    ttk.Label(tracks_frame, text='Affected tracks').pack(anchor='w')
-    group_list = tk.Listbox(groups_frame, width=19, exportselection=False, bg=palette['bg'], fg=palette['fg'], selectbackground=palette['select'], relief='flat')
-    group_list.pack(fill='both', expand=True)
-    genre_list = tk.Listbox(genres_frame, selectmode='extended', exportselection=False, bg=palette['bg'], fg=palette['fg'], selectbackground=palette['select'], relief='flat')
-    genre_list.pack(fill='both', expand=True)
-    track_list = tk.Listbox(tracks_frame, bg=palette['bg'], fg=palette['fg'], selectbackground=palette['select'], relief='flat')
-    track_list.pack(fill='both', expand=True)
-    shown_genres = []
-    shown_groups = []
+    viewport = tk.Frame(host, bg=dark)
+    viewport.pack(fill='both', expand=True, padx=10, pady=8)
+    canvas = tk.Canvas(viewport, bg=dark, highlightthickness=0)
+    hbar = ttk.Scrollbar(viewport, orient='horizontal', command=canvas.xview)
+    vbar = ttk.Scrollbar(viewport, orient='vertical', command=canvas.yview)
+    canvas.configure(xscrollcommand=hbar.set, yscrollcommand=vbar.set)
+    hbar.pack(side='bottom', fill='x')
+    vbar.pack(side='right', fill='y')
+    canvas.pack(side='left', fill='both', expand=True)
+    inside = tk.Frame(canvas, bg=dark)
+    window_id = canvas.create_window((0, 0), window=inside, anchor='nw')
+    inside.bind('<Configure>', lambda _: canvas.configure(scrollregion=canvas.bbox('all')))
 
-    def chosen():
-        return [shown_genres[i] for i in genre_list.curselection() if i < len(shown_genres)]
+    def families():
+        names = list(DEFAULT_GROUPS) + [g for g in custom_groups if g not in DEFAULT_GROUPS]
+        genres = inventory(app.rows, custom_genres)
+        grouped = {g: [] for g in names}
+        for genre in genres:
+            group = organization.get(genre, genre_group(genre))
+            if group not in grouped:
+                group = 'Other'
+            grouped[group].append(genre)
+        # Suggested subgenres are visible even if no tracks currently use them.
+        for group, suggestions in SUGGESTED.items():
+            for name in suggestions:
+                if name not in grouped[group]:
+                    grouped[group].append(name)
+        for group in grouped:
+            if group not in grouped[group]:
+                grouped[group].insert(0, group)
+            grouped[group] = sorted(set(grouped[group]), key=lambda x: (x != group, x.casefold()))
+        return grouped, genres
 
-    def update_tracks(*_):
-        paths = list(dict.fromkeys(p for genre in chosen() for p in inventory(app.rows, custom_genres).get(genre, [])))
-        track_list.delete(0, 'end')
-        for path in paths:
-            row = app.rows[path]
-            track_list.insert('end', f"{row.get('artist', '')} — {row.get('title', Path(path).stem)}")
-        status.set(f'{len(paths)} tracks selected · {len(chosen())} genres')
+    def selected_count():
+        return len(chosen)
+
+    def refresh_status(note=None):
+        if note:
+            status.set(note)
+        else:
+            status.set(f'{selected_count()} subgenres selected · Save Changes writes Genre = family and Composer = original genre')
 
     def redraw(*_):
-        previous = set(chosen())
-        genres = inventory(app.rows, custom_genres)
-        group_names = ['All Genres', *DEFAULT_GROUPS, *[g for g in custom_groups if g not in DEFAULT_GROUPS]]
-        current = selected_group.get()
-        if current not in group_names:
-            current = 'All Genres'
-            selected_group.set(current)
-        shown_groups[:] = group_names
-        group_list.delete(0, 'end')
-        for group in group_names:
-            count = sum(len(paths) for name, paths in genres.items() if group == 'All Genres' or organization.get(name, genre_group(name)) == group)
-            group_list.insert('end', f'{group}  ({count})')
-        group_list.selection_set(group_names.index(current))
-        shown_genres[:] = sorted((name for name in genres if (current == 'All Genres' or organization.get(name, genre_group(name)) == current) and query.get().casefold() in name.casefold()), key=str.casefold)
-        genre_list.delete(0, 'end')
-        for i, name in enumerate(shown_genres):
-            genre_list.insert('end', f'{name}  ({len(genres[name])})')
-            if name in previous:
-                genre_list.selection_set(i)
-        update_tracks()
+        for widget in inside.winfo_children():
+            widget.destroy()
+        family_widgets.clear()
+        grouped, genres = families()
+        search = query.get().strip().casefold()
+        for index, (group, names) in enumerate(grouped.items()):
+            column = tk.Frame(inside, bg=panel, width=215, padx=8, pady=8, highlightbackground='#383B42', highlightthickness=1)
+            column.grid(row=0, column=index, sticky='ns', padx=5, pady=5)
+            shown = [name for name in names if not search or search in name.casefold() or search in group.casefold()]
+            all_selected = bool(shown) and all((group, name) in chosen for name in shown)
+            def choose_family(g=group, entries=tuple(shown)):
+                if all((g, name) in chosen for name in entries):
+                    chosen.difference_update((g, name) for name in entries)
+                else:
+                    chosen.update((g, name) for name in entries)
+                redraw()
+            heading = tk.Button(column, text=('☑ ' if all_selected else '□ ') + group,
+                                command=choose_family, bg='#3E3823' if all_selected else '#30333A',
+                                fg=yellow, activebackground='#4A422A', activeforeground=yellow,
+                                relief='flat', anchor='w', font=('Helvetica', 12, 'bold'), padx=8, pady=8)
+            heading.pack(fill='x')
+            family_widgets[group] = column
+            for name in shown:
+                is_selected = (group, name) in chosen
+                def toggle(g=group, n=name):
+                    key = (g, n)
+                    if key in chosen:
+                        chosen.remove(key)
+                    else:
+                        chosen.add(key)
+                    redraw()
+                btn = tk.Button(column, text=('☑ ' if is_selected else '□ ') + f'{name}  ({len(genres.get(name, []))})',
+                                command=toggle, bg='#3E3823' if is_selected else panel,
+                                fg=fg, activebackground='#4A422A', activeforeground=fg,
+                                relief='flat', anchor='w', padx=7, pady=4, wraplength=185)
+                btn.pack(fill='x', pady=1)
+            tk.Button(column, text='+ Add subgenre', command=lambda g=group: add_genre(g),
+                      bg=panel, fg=yellow, activebackground=panel, activeforeground=yellow,
+                      relief='flat', anchor='w').pack(fill='x', pady=(10, 0))
+        canvas.configure(scrollregion=canvas.bbox('all'))
+        refresh_status()
 
-    def choose_group(_=None):
-        sel = group_list.curselection()
-        if sel:
-            selected_group.set(shown_groups[sel[0]])
-            redraw()
+    def add_genre(group):
+        name = simpledialog.askstring('Add subgenre', f'New subgenre under {group}:', parent=host)
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        if name not in inventory(app.rows, custom_genres):
+            custom_genres.append(name)
+        organization[name] = group
+        app.save_preferences()
+        redraw()
 
     def add_group():
-        name = simpledialog.askstring('New group', 'Group name:', parent=host)
+        name = simpledialog.askstring('Add main genre', 'New main genre name:', parent=host)
         if not name or not name.strip():
             return
         name = name.strip()
         if name not in DEFAULT_GROUPS and name not in custom_groups:
             custom_groups.append(name)
             app.save_preferences()
-        selected_group.set(name)
-        destination.set(name)
         redraw()
 
-    def rename_group():
-        old = selected_group.get()
-        if old == 'All Genres' or old in DEFAULT_GROUPS:
-            return messagebox.showinfo('Genre groups', 'Select a custom group to rename.', parent=host)
-        name = simpledialog.askstring('Rename group', 'New group name:', initialvalue=old, parent=host)
-        if not name or not name.strip() or name.strip() == old:
-            return
-        name = name.strip()
-        if name in DEFAULT_GROUPS or name in custom_groups:
-            return messagebox.showwarning('Genre groups', 'That group already exists.', parent=host)
-        custom_groups.remove(old)
-        custom_groups.append(name)
-        for genre, group in list(organization.items()):
-            if group == old:
-                organization[genre] = name
-        selected_group.set(name)
-        app.save_preferences()
-        redraw()
-
-    def add_genre():
-        name = simpledialog.askstring('New genre', 'Genre name (organization only; does not edit music files):', parent=host)
-        if not name or not name.strip():
-            return
-        name = name.strip()
-        if name not in inventory(app.rows, custom_genres):
-            custom_genres.append(name)
-        if selected_group.get() != 'All Genres':
-            organization[name] = selected_group.get()
-        app.save_preferences()
-        selected_group.set('All Genres')
-        redraw()
-        if name in shown_genres:
-            genre_list.selection_clear(0, 'end')
-            genre_list.selection_set(shown_genres.index(name))
-            genre_list.see(shown_genres.index(name))
-            update_tracks()
-
-    def move_genres():
-        names = chosen()
-        group = destination.get().strip()
-        if not names or not group:
-            return messagebox.showwarning('Organize genres', 'Select genres and a destination group.', parent=host)
-        if group not in DEFAULT_GROUPS and group not in custom_groups:
-            custom_groups.append(group)
-        for name in names:
-            organization[name] = group
-        app.save_preferences()
-        redraw()
-        status.set(f'Moved {len(names)} genre labels into {group}; no audio files changed.')
-
-    def write_genres():
-        names = chosen()
-        target = replacement.get().strip()
-        if not names or not target:
-            return messagebox.showwarning('Rename genres', 'Select genres and enter a replacement.', parent=host)
-        genres = inventory(app.rows, custom_genres)
-        paths = list(dict.fromkeys(path for name in names for path in genres[name]))
-        if not paths:
-            return messagebox.showinfo('Rename genres', 'No tracks use the selected genres. You can organize empty genres without writing files.', parent=host)
-        preview = '\n'.join(f'  {name} ({len(genres[name])}) → {target}' for name in names[:12])
-        if not messagebox.askyesno('Confirm genre changes', f'Preview:\n{preview}\n\nWrite Genre = {target} to {len(paths)} music files?\nBackups and history will be recorded.', parent=host):
-            return
-        if preserve.get() and not messagebox.askyesno('Composer / Subgenre', 'Preserving the original Genre in Composer will overwrite existing Composer tags. Continue?', parent=host):
+    def write_changes():
+        # No preview or confirmation by design. The only mutation trigger is Save.
+        assignments = {name: group for group, name in chosen}
+        changes_by_path = plan_genre_writes(app.rows, assignments)
+        if not changes_by_path:
+            refresh_status('No tracks require changes for the selected subgenres.')
             return
         journal, errors = [], []
-        for path in paths:
+        for path, changes in changes_by_path.items():
             row = app.rows[path]
             before = {'genre': row.get('genre', ''), 'composer': row.get('composer', '')}
-            changes = {'genre': target}
-            if preserve.get():
-                changes['composer'] = before['genre']
             try:
-                safe_write(path, changes, {}, write_any_tags, read_any_track, app.data_dir / 'metadata_recovery', expected=row.get('disk_fingerprint'))
+                safe_write(path, changes, {}, write_any_tags, read_any_track,
+                           app.data_dir / 'metadata_recovery', expected=row.get('disk_fingerprint'))
                 journal.append({'path': path, 'before': before, 'after': changes})
                 row.update(read_any_track(path))
                 row['status'] = 'Genre Cleanup — saved'
@@ -211,50 +207,16 @@ def open_genre_workspace(app):
         if journal:
             app.store.history('genre_cleanup_written', {'files': journal})
         app.persist_library()
+        chosen.clear()
         redraw()
-        messagebox.showinfo('Genre Cleanup', f'{len(journal)} files updated; {len(errors)} failed.' + ('\n' + '\n'.join(errors[:5]) if errors else ''), parent=host)
+        refresh_status(f'Saved {len(journal)} files · {len(errors)} errors' + (f' · {errors[0]}' if errors else ''))
 
-    def drop_on_group(event):
-        """Drag selected genres onto a group to organize them, without writing tags."""
-        names = chosen()
-        if not names:
-            return
-        target = host.winfo_containing(event.x_root, event.y_root)
-        if target is not group_list:
-            return
-        index = group_list.nearest(event.y_root - group_list.winfo_rooty())
-        if not 0 <= index < len(shown_groups):
-            return
-        group = shown_groups[index]
-        if group == 'All Genres':
-            return
-        for name in names:
-            organization[name] = group
-        app.save_preferences()
-        selected_group.set(group)
-        redraw()
-        status.set(f'Moved {len(names)} genre labels into {group}; no audio files changed.')
-
-    genre_list.bind('<ButtonRelease-1>', drop_on_group, add='+')
-    group_list.bind('<<ListboxSelect>>', choose_group)
-    genre_list.bind('<<ListboxSelect>>', update_tracks)
+    ttk.Button(toolbar, text='+ Add Main Genre', command=add_group).pack(side='left', padx=(12, 4))
+    ttk.Button(toolbar, text='Clear Selection', command=lambda: (chosen.clear(), redraw())).pack(side='left')
+    footer = ttk.Frame(host, padding=(12, 8))
+    footer.pack(fill='x')
+    ttk.Label(footer, textvariable=status, style='Muted.TLabel').pack(side='left', fill='x', expand=True)
+    ttk.Button(footer, text='History / Restore', command=app.genre_restore_history).pack(side='right', padx=5)
+    ttk.Button(footer, text='Save Changes', command=write_changes, style='Accent.TButton').pack(side='right', padx=5)
     query.trace_add('write', redraw)
-    group_buttons = ttk.Frame(host, padding=(12, 5))
-    group_buttons.pack(fill='x')
-    ttk.Button(group_buttons, text='+ New Group', command=add_group).pack(side='left', padx=3)
-    ttk.Button(group_buttons, text='Rename Group', command=rename_group).pack(side='left', padx=3)
-    ttk.Button(group_buttons, text='+ Add Genre', command=add_genre).pack(side='left', padx=3)
-    ttk.Label(group_buttons, text='Move selected genres to:').pack(side='left', padx=(14, 5))
-    group_combo = ttk.Combobox(group_buttons, textvariable=destination, values=list(DEFAULT_GROUPS) + list(custom_groups), width=17)
-    group_combo.pack(side='left')
-    ttk.Button(group_buttons, text='Move', command=move_genres).pack(side='left', padx=5)
-
-    edit = ttk.Frame(host, padding=(12, 8))
-    edit.pack(fill='x')
-    ttk.Label(edit, text='Rename / merge selected genres:').pack(side='left', padx=(0, 7))
-    ttk.Entry(edit, textvariable=replacement, width=22).pack(side='left', padx=4)
-    ttk.Checkbutton(edit, text='Copy original Genre to Composer', variable=preserve).pack(side='left', padx=8)
-    ttk.Button(edit, text='Preview & Save to Files', command=write_genres, style='Accent.TButton').pack(side='left', padx=5)
-    ttk.Button(edit, text='History / Restore', command=app.genre_restore_history).pack(side='right')
-    ttk.Label(host, textvariable=status, style='Muted.TLabel').pack(anchor='w', padx=14, pady=(0, 8))
     redraw()
