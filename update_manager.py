@@ -14,7 +14,7 @@ from importlib.metadata import version as pkg_version
 import requests
 
 REPO = 'manoffish14-doc/DJ-Tag-Manager'
-VERSION = '3.0.0'
+VERSION = '3.0.1'
 ZIP_NAME = 'DJ-Tag-Manager-Mac.zip'
 CHECKSUM_NAME = ZIP_NAME + '.sha256'
 
