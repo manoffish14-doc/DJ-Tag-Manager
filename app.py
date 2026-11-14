@@ -44,6 +44,33 @@ def apply_dark_theme(root):
     style.configure('Muted.TLabel', background=COLORS['bg'], foreground=COLORS['muted'])
     style.configure('Brand.TLabel', background=COLORS['bg'], foreground=COLORS['accent'],
                     font=('Helvetica Neue', 23, 'bold'))
+    # Rounded button surfaces using native Tk photo-image 9-slice elements.
+    # Images stay attached to the root so Tk does not garbage-collect them.
+    def rounded_image(color, radius=9, size=26):
+        pic = tk.PhotoImage(master=root, width=size, height=size)
+        pic.put(color, to=(radius, 0, size-radius, size))
+        for y in range(size):
+            for x in range(size):
+                if (x < radius or x >= size-radius) and (y < radius or y >= size-radius):
+                    cx = radius if x < radius else size-radius-1
+                    cy = radius if y < radius else size-radius-1
+                    if (x-cx)**2 + (y-cy)**2 <= radius**2:
+                        pic.put(color, (x, y))
+                elif radius <= y < size-radius:
+                    pic.put(color, (x, y))
+        return pic
+
+    images = [rounded_image(COLORS[c]) for c in ('raised', 'hover', 'accent', 'accent_hover')]
+    root._dj_rounded_images = images
+    for name, normal, hover in [('DJRound', images[0], images[1]),
+                                ('DJAccentRound', images[2], images[3])]:
+        style.element_create(name, 'image', normal,
+                             ('pressed', hover), ('active', hover),
+                             border=11, sticky='nsew')
+        style.layout(('Accent.TButton' if name == 'DJAccentRound' else 'TButton'),
+                     [(name, {'sticky': 'nswe', 'children':
+                       [('Button.padding', {'sticky': 'nswe', 'children':
+                         [('Button.label', {'sticky': 'nswe'})]})]})])
     style.configure('TButton', background=COLORS['raised'], foreground=COLORS['text'],
                     borderwidth=0, padding=(13, 9), relief='flat',
                     font=('Helvetica', 12, 'bold'))
@@ -873,71 +900,75 @@ class App:
         self.show_details()
 
     def edit_song_cell(self, event):
-        """Open a readable editor above the tree, never a tiny clipped cell overlay."""
+        """Edit text tags directly in the table; never open a separate dialog."""
         if self.tree.identify_region(event.x, event.y) != 'cell':
             return
-        column = self.tree.identify_column(event.x)
         path = self.tree.identify_row(event.y)
-        if not path:
+        column = self.tree.identify_column(event.x)
+        if not path or not column.startswith('#'):
             return
-        try:
-            index = int(column[1:]) - 1
-        except (ValueError, IndexError):
-            return
-        if not (0 <= index < len(self.visible_columns)):
+        index = int(column[1:]) - 1
+        if not 0 <= index < len(self.visible_columns):
             return
         field = self.visible_columns[index]
         if field not in EDITABLE_FIELDS:
             return
+        self._start_inline_edit(path, field)
+
+    def _start_inline_edit(self, path, field):
         if self.inline_editor is not None:
             self.inline_editor.destroy()
             self.inline_editor = None
-        row = self.rows[path]
-        original = display_value(row, field)
-        window = tk.Toplevel(self.root)
-        style_popup(window)
-        self.inline_editor = window
-        window.title('Edit ' + COLUMN_LABELS[field])
-        window.geometry('780x170')
-        window.minsize(460, 150)
-        window.transient(self.root)
-        window.resizable(True, False)
-        window.columnconfigure(0, weight=1)
-        ttk.Label(window, text=f'{COLUMN_LABELS[field]} — {Path(path).name}',
-                  wraplength=730).grid(row=0, column=0, sticky='w', padx=16, pady=(12, 6))
-        value = tk.StringVar(value=str(original))
-        entry = ttk.Entry(window, textvariable=value, font=('Helvetica', 16))
-        entry.grid(row=1, column=0, sticky='ew', padx=16, pady=4, ipady=5)
-        entry.focus_set()
-        entry.select_range(0, tk.END)
-        footer = ttk.Frame(window)
-        footer.grid(row=2, column=0, sticky='e', padx=16, pady=10)
+        try:
+            column_number = self.visible_columns.index(field) + 1
+        except ValueError:
+            return
+        bbox = self.tree.bbox(path, f'#{column_number}')
+        if not bbox:
+            self.tree.see(path)
+            bbox = self.tree.bbox(path, f'#{column_number}')
+        if not bbox:
+            return
+        x, y, width, height = bbox
+        original = str(display_value(self.rows[path], field))
+        value = tk.StringVar(value=original)
+        editor = ttk.Entry(self.tree, textvariable=value, font=('Helvetica', 14))
+        self.inline_editor = editor
+        # Extend a narrow cell into available empty space so long titles are legible.
+        available = max(width, self.tree.winfo_width() - x - 8)
+        editor.place(x=x, y=y, width=min(max(width, min(available, 580)), available), height=max(height, 28))
+        editor.focus_set()
+        editor.icursor(tk.END)
         finished = [False]
 
-        def finish(save):
+        def finish(save, next_field=False):
             if finished[0]:
                 return
             finished[0] = True
             new_text = value.get().strip()
-            if self.inline_editor is window:
+            if self.inline_editor is editor:
                 self.inline_editor = None
-            window.destroy()
-            if not save:
-                return
-            row.setdefault('pending_tags', {})[field] = new_text
-            if field in ('title', 'artist'):
-                row['suggested_' + field] = new_text
-                self.save_names.set(True)
-            row['status'] = f'Edited {field} — pending save'
-            self.refresh(path)
-            self.tree.selection_set(path)
-            self.show_details()
+            editor.destroy()
+            if save:
+                row = self.rows[path]
+                row.setdefault('pending_tags', {})[field] = new_text
+                if field in ('title', 'artist'):
+                    row['suggested_' + field] = new_text
+                    self.save_names.set(True)
+                row['status'] = f'Edited {field} — pending save'
+                self.refresh(path)
+                self.tree.selection_set(path)
+                self.show_details()
+            if next_field and save:
+                following = [c for c in self.visible_columns if c in EDITABLE_FIELDS]
+                if field in following:
+                    self.root.after_idle(lambda: self._start_inline_edit(path, following[(following.index(field)+1)%len(following)]))
 
-        ttk.Button(footer, text='Cancel', command=lambda: finish(False)).pack(side='right', padx=4)
-        ttk.Button(footer, text='Apply Edit', style='Accent.TButton', command=lambda: finish(True)).pack(side='right', padx=4)
-        entry.bind('<Return>', lambda e: finish(True))
-        entry.bind('<Escape>', lambda e: finish(False))
-        window.protocol('WM_DELETE_WINDOW', lambda: finish(False))
+        editor.bind('<Return>', lambda e: (finish(True), 'break')[1])
+        editor.bind('<Escape>', lambda e: (finish(False), 'break')[1])
+        editor.bind('<Tab>', lambda e: (finish(True, True), 'break')[1])
+        # Do not save silently when clicking elsewhere: preserve edits on focus-out.
+        editor.bind('<FocusOut>', lambda e: finish(True))
 
     def add_paths(self, paths):
         errors = 0

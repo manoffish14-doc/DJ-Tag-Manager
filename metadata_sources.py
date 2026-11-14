@@ -94,7 +94,7 @@ def spotify(artist,title,client_id,secret):
 
 # Order matters: specific labels first, broad fallbacks afterward.
 GENRES={
- 'R&B':['contemporary r&b','alternative r&b','new jack swing','neo soul','rhythm and blues','r&b','rnb','r&b/soul','urban contemporary','soul'],
+ 'R&B':['contemporary r&b','alternative r&b','new jack swing','neo soul','rhythm and blues','r&b','rnb','r&b/soul','urban contemporary','soul','funk / soul','funk/soul','funk and soul'],
  'Hip Hop':['southern hip hop','east coast hip hop','west coast hip hop','trap','drill','boom bap','hip-hop','hip hop','hip hop/rap','rap'],
  'Afrobeats':['afrobeats','afropop','afro pop','afro-fusion','afroswing'],
  'Dancehall':['dancehall','ragga'],
@@ -108,16 +108,33 @@ GENRES={
  'Jazz':['jazz'],
  'Funk':['funk'],
 }
-GENERIC={'seen live','favorites','favorite','american','male vocalists','female vocalists','00s','2000s','2010s','90s','80s','awesome','love','music'}
+GENERIC = {'seen live', 'favorites', 'favorite', 'american', 'male vocalists',
+           'female vocalists', '00s', '2000s', '2010s', '90s', '80s',
+           'awesome', 'love', 'music', 'audio', 'unknown', 'official video',
+           'lyrics', 'video', 'youtube', 'subscribe', 'other', 'miscellaneous'}
+
+
+def valid_genre(tag):
+    """Reject noise, not unfamiliar but legitimate styles."""
+    cleaned = re.sub(r'\s+', ' ', str(tag or '')).strip()
+    lower = cleaned.casefold()
+    return bool(cleaned and len(cleaned) <= 75 and lower not in GENERIC
+                and not re.fullmatch(r'[0-9\W_]+', cleaned)
+                and not re.fullmatch(r'(?:19|20)\d{2}s?', lower))
+
 
 def classify(tags):
-    for tag in tags:
-        cleaned=tag.casefold().strip()
-        if cleaned in GENERIC:continue
-        for broad,variants in GENRES.items():
-            if cleaned in variants:
-                # Preserve specific source tag in Composer; for broad-only tags leave subgenre blank.
-                return broad, tag.title() if cleaned != broad.casefold() else ''
+    """Prefer broad genres; preserve valid niche labels as a fallback."""
+    usable = [str(t).strip() for t in tags if valid_genre(t)]
+    for tag in usable:
+        cleaned = tag.casefold()
+        for broad, variants in GENRES.items():
+            if cleaned == broad.casefold() or cleaned in variants:
+                subgenre = tag if cleaned != broad.casefold() else ''
+                return broad, subgenre
+    # Never silently drop a legitimate style just because our mapping is incomplete.
+    if usable:
+        return usable[0], ''
     return '', ''
 
 def lookup(artist, title, config):
@@ -166,9 +183,9 @@ def lookup(artist, title, config):
         tags.extend(t for r in results if r['source'] == name for t in r.get('tags', []))
     genre, subgenre = classify(tags)
     debug['genre_candidates'] = tags[:40]
-    debug['rejected_tags'] = [t for t in tags if t.casefold().strip() in GENERIC]
+    debug['rejected_tags'] = [t for t in tags if not valid_genre(t)]
     debug['genre_decision'] = {'genre': genre or None, 'subgenre': subgenre or None,
-        'reason': 'recognized_genre_tag' if genre else ('unrecognized_or_generic_tags' if tags else 'no_genre_tags_returned')}
+        'reason': ('recognized_or_preserved_genre' if genre else ('only_generic_or_invalid_tags' if tags else 'no_genre_tags_returned'))}
     return {'year': str(min(years)) if years else '', 'genre': genre, 'subgenre': subgenre,
             'sources': [r['source'] for r in results], 'errors': errors, 'tags': tags[:20],
             'score': 'Review', 'lookup_debug': debug,
