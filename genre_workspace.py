@@ -120,6 +120,17 @@ def open_genre_workspace(app):
         else:
             status.set(f'{selected_count()} subgenres selected · Save Changes writes Genre = family and Composer = original genre')
 
+    def dark_action(parent, title, callback, *, bg=panel, color=fg, bold=False, pad_y=7):
+        """Clickable Label instead of macOS Aqua tk.Button (which ignores dark bg/fg)."""
+        label = tk.Label(parent, text=title, bg=bg, fg=color,
+                             font=('Helvetica', 12, 'bold' if bold else 'normal'),
+                             anchor='w', justify='left', padx=10, pady=pad_y,
+                             cursor='hand2', highlightthickness=0, borderwidth=0)
+        label.bind('<Button-1>', lambda _event: callback())
+        label.bind('<Enter>', lambda _event: label.configure(bg='#45403A' if bg != panel else '#363B44'))
+        label.bind('<Leave>', lambda _event: label.configure(bg=bg))
+        return label
+
     def redraw(*_):
         for widget in inside.winfo_children():
             widget.destroy()
@@ -127,7 +138,7 @@ def open_genre_workspace(app):
         grouped, genres = families()
         search = query.get().strip().casefold()
         for index, (group, names) in enumerate(grouped.items()):
-            column = tk.Frame(inside, bg=panel, width=215, padx=8, pady=8, highlightbackground='#383B42', highlightthickness=1)
+            column = tk.Frame(inside, bg=panel, width=245, padx=8, pady=8, highlightbackground='#383B42', highlightthickness=1)
             column.grid(row=0, column=index, sticky='ns', padx=5, pady=5)
             shown = [name for name in names if not search or search in name.casefold() or search in group.casefold()]
             all_selected = bool(shown) and all((group, name) in chosen for name in shown)
@@ -137,10 +148,9 @@ def open_genre_workspace(app):
                 else:
                     chosen.update((g, name) for name in entries)
                 redraw()
-            heading = tk.Button(column, text=('☑ ' if all_selected else '□ ') + group,
-                                command=choose_family, bg='#3E3823' if all_selected else '#30333A',
-                                fg=yellow, activebackground='#4A422A', activeforeground=yellow,
-                                relief='flat', anchor='w', font=('Helvetica', 12, 'bold'), padx=8, pady=8)
+            heading = dark_action(column, ('☑ ' if all_selected else '□ ') + group,
+                                  choose_family, bg='#3E3823' if all_selected else '#30333A',
+                                  color=yellow, bold=True, pad_y=10)
             heading.pack(fill='x')
             family_widgets[group] = column
             for name in shown:
@@ -152,14 +162,13 @@ def open_genre_workspace(app):
                     else:
                         chosen.add(key)
                     redraw()
-                btn = tk.Button(column, text=('☑ ' if is_selected else '□ ') + f'{name}  ({len(genres.get(name, []))})',
-                                command=toggle, bg='#3E3823' if is_selected else panel,
-                                fg=fg, activebackground='#4A422A', activeforeground=fg,
-                                relief='flat', anchor='w', padx=7, pady=4, wraplength=185)
+                btn = dark_action(column,
+                                  ('☑ ' if is_selected else '□ ') + f'{name}  ({len(genres.get(name, []))})',
+                                  toggle, bg='#3E3823' if is_selected else panel,
+                                  color=fg, pad_y=6)
                 btn.pack(fill='x', pady=1)
-            tk.Button(column, text='+ Add subgenre', command=lambda g=group: add_genre(g),
-                      bg=panel, fg=yellow, activebackground=panel, activeforeground=yellow,
-                      relief='flat', anchor='w').pack(fill='x', pady=(10, 0))
+            dark_action(column, '+ Add subgenre', lambda g=group: add_genre(g),
+                        bg=panel, color=yellow).pack(fill='x', pady=(10, 0))
         canvas.configure(scrollregion=canvas.bbox('all'))
         refresh_status()
 
