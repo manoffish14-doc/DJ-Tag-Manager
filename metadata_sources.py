@@ -3,8 +3,10 @@ import re
 import time
 from difflib import SequenceMatcher
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-UA = 'DJTagManager/0.5 (personal music library tagging)'
+UA = 'DJTagManager/3.1 (music library metadata lookup; contact: https://github.com/manoffish14-doc/DJ-Tag-Manager)'
 HEADERS = {'User-Agent': UA}
 
 def norm(s):
@@ -16,8 +18,33 @@ def similar(a,b):
     a,b=norm(a),norm(b)
     return bool(a and b) and (a==b or SequenceMatcher(None,a,b).ratio()>=.88)
 
+def clean_query(artist, title):
+    """Normalize video-derived metadata for searching; never alter the source tags."""
+    artist = (artist or '').strip()
+    title = (title or '').strip()
+    video_title = bool(re.search(r'\b(?:official|lyrics|lyric video|music video)\b', title, re.I))
+    # Titles downloaded from video sites frequently start with the credited artist.
+    title = re.sub(r'\s*\([^)]*\b(?:official|music video|lyric|lyrics|audio|visualizer|video)\b[^)]*\)', '', title, flags=re.I)
+    title = re.sub(r'\s*\[[^]]*\b(?:official|lyric|lyrics|audio|video)\b[^]]*\]', '', title, flags=re.I)
+    artist = re.split(r'\s+(?:ft\.?|feat\.?|featuring)\s+', artist, maxsplit=1, flags=re.I)[0].strip()
+    # The leading artist may be embedded in the title, even if the artist tag is an uploader.
+    if ' - ' in title:
+        lead, remainder = title.split(' - ', 1)
+        if not artist or similar(lead, artist) or video_title:
+            artist, title = lead.strip(), remainder.strip()
+    title = re.sub(r'\s+(?:ft\.?|feat\.?|featuring)\s+.+$', '', title, flags=re.I)
+    title = re.sub(r'\s+', ' ', title).strip(' -')
+    return artist, title
+
+_SESSION = requests.Session()
+_RETRY = Retry(total=2, connect=1, read=1, status=2,
+               status_forcelist=[429, 500, 502, 503, 504],
+               allowed_methods=frozenset(['GET']), backoff_factor=0.8,
+               respect_retry_after_header=True)
+_SESSION.mount('https://', HTTPAdapter(max_retries=_RETRY))
+
 def get(url, params=None, headers=None, auth=None):
-    r=requests.get(url, params=params, headers=headers or HEADERS, auth=auth, timeout=12)
+    r=_SESSION.get(url, params=params, headers=headers or HEADERS, auth=auth, timeout=(4, 8))
     r.raise_for_status()
     return r.json()
 
@@ -140,7 +167,10 @@ def classify(tags):
 
 def lookup(artist, title, config):
     """Return per-provider, redacted diagnostics to explain missing genres."""
-    debug = {'search_artist': artist, 'search_title': title, 'providers': {},
+    original_artist, original_title = artist, title
+    artist, title = clean_query(artist, title)
+    debug = {'search_artist': artist, 'search_title': title,
+             'original_search_artist': original_artist, 'original_search_title': original_title, 'providers': {},
              'genre_candidates': [], 'rejected_tags': [], 'genre_decision': {}}
     if not artist or not title:
         return {'error': 'Artist and title are needed for lookup.', 'lookup_debug': debug,
@@ -191,4 +221,5 @@ def lookup(artist, title, config):
             'sources': [r['source'] for r in results], 'errors': errors, 'tags': tags[:20],
             'score': 'Review', 'lookup_debug': debug,
             'recording_id': next((r.get('recording_id') for r in results if r.get('recording_id')), None),
-            'error': 'No matching metadata found.' if not results else None}
+            'error': ('Metadata lookup failed: ' + '; '.join(errors) if errors and not results else
+                      'No matching metadata found.' if not results else None)}

@@ -1688,7 +1688,7 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
         lookup = tk.BooleanVar(value=self.auto_lookup.get())
         ttk.Checkbutton(body, text='Analyze BPM and Camelot key on import', variable=analyze).pack(anchor='w', pady=(15, 5))
         ttk.Checkbutton(body, text='Find tags and artwork on import', variable=lookup).pack(anchor='w', pady=5)
-        ttk.Label(body, text='Off by default. Proposed tag writes require confirmation.').pack(anchor='w', pady=10)
+        ttk.Label(body, text='Off by default. Genre saves automatically; other tags need approval.').pack(anchor='w', pady=10)
         def save():
             self.auto_bpm.set(analyze.get())
             self.auto_lookup.set(lookup.get())
@@ -1707,7 +1707,7 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
         job_id = self.queue_engine.add(kind, paths)
         if kind in ('lookup', 'lookup_analyze', 'analyze_metadata'):
             self._lookup_job_options[job_id] = dict(options or self._saved_lookup_options())
-        self.status.configure(text=f'{kind.title()} queued for {len(paths)} tracks (task #{job_id}).')
+        self.status.configure(text=f'{self._task_name(kind)} queued for {len(paths)} tracks (task #{job_id}).')
 
     def lookup(self):
         paths = self.selected()
@@ -1737,7 +1737,7 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
                            ('review', 'Find missing or potentially incorrect fields'),
                            ('all', 'Compare all selected fields')]:
             ttk.Radiobutton(body, text=label, value=key, variable=mode).pack(anchor='w', pady=3)
-        ttk.Label(body, text='All proposed changes require approval before writing files.').pack(anchor='w', pady=(12, 8))
+        ttk.Label(body, text='Genres save automatically; other fields require approval.').pack(anchor='w', pady=(12, 8))
         buttons = ttk.Frame(body)
         buttons.pack(side='bottom', fill='x', pady=(12, 0))
         ttk.Button(buttons, text='Cancel', command=win.destroy).pack(side='right', padx=(8, 0))
@@ -1786,6 +1786,8 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
                     continue
                 if event[0] == 'queue_result':
                     _,job_id,kind,path,result=event
+                    if any(j['id']==job_id and j['state']=='cancelled' for j in self.queue_engine.snapshot()):
+                        continue
                     event=('result',kind,path,result)
                 if event[0] == 'key_result':
                     _,path,value=event
@@ -1808,7 +1810,7 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
                 r = self.rows.get(path)
                 if not r:
                     continue
-                if result.get('error') and kind != 'lookup_analyze':
+                if result.get('error') and kind not in ('lookup', 'lookup_analyze'):
                     if kind == 'lookup':
                         r['lookup_debug'] = result.get('lookup_debug', {})
                         r['lookup_warnings'] = result.get('errors', [])
@@ -1850,10 +1852,7 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
                     r['match'] = (f'{confidence}% MusicBrainz' if isinstance(confidence,(int,float)) else
                                   ('Multiple sources' if provider_count>1 else 'Review'))
                     r['status'] = 'Lookup: ' + ', '.join(result.get('sources', [])) if result.get('sources') else 'No match'
-                    if result.get('error') and analysis.get('error'):
-                        r['status'] = 'Lookup and analysis unavailable — no write'
-                    else:
-                        self._confirm_lookup_write(path, result, analysis, options=options)
+                    self._confirm_lookup_write(path, result, analysis, options=options)
                     if 'art' in options['fields'] and result.get('recording_id') and Path(path).suffix.lower() == '.mp3':
                         self._queue_artwork_preview(path, result['recording_id'])
                 else:
@@ -1942,37 +1941,63 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
         ttk.Button(body,text='Save Preferences',command=save,style='Accent.TButton').pack(anchor='e',pady=18)
 
     def _confirm_lookup_write(self, path, lookup, analysis, options=None):
-        """Show a per-file overwrite prompt; all writes use recovery journal."""
+        """Automatically save lookup genre; ask before writing other fields."""
+        from genre_fallback import genre_decision
         r = self.rows.get(path)
         if not r:
             return
-        settings = self.extra_settings.get('metadata_automation', {})
         options = options or self._saved_lookup_options()
         enabled = [field for field in options['fields'] if field != 'art']
-        # A user must explicitly opt in to Composer/subgenre replacement.
         changes = metadata_proposal(r, lookup, analysis, fields=enabled,
                                     replace_existing=(options['mode'] != 'missing'))
+        # Genre is deliberately exempt from the 'missing only' search scope:
+        # a database result updates an existing genre; an artist guess never does.
+        genre_source = 'none'
+        if 'genre' in enabled:
+            artist = r.get('suggested_artist') or r.get('artist') or ''
+            chosen, genre_source = genre_decision(r.get('genre'), lookup.get('genre'), artist)
+            if chosen and chosen != (r.get('genre') or ''):
+                changes['genre'] = chosen
+            else:
+                changes.pop('genre', None)
+        genre_change = changes.pop('genre', None)
+        if genre_change:
+            try:
+                safe_write(path, {'genre': genre_change}, {}, write_any_tags, read_any_track,
+                           self.data_dir / 'metadata_recovery', expected=r.get('disk_fingerprint'))
+                r.update(read_any_track(path))
+                r['disk_fingerprint'] = fingerprint(path)
+                r.pop('suggested_genre', None)
+                r['genre_lookup_source'] = genre_source
+                r['status'] = 'Genre saved automatically (' + genre_source + ')'
+                r['written'] = True
+                self.undo_stack.clear(); self.redo_stack.clear()
+                self.persist_library()
+            except Exception as exc:
+                r['status'] = 'Genre write blocked: ' + str(exc)[:100]
+                messagebox.showerror('Genre write blocked', str(exc), parent=self.root)
+                return
         if not changes:
-            r['status'] = 'Lookup complete — no eligible new fields'
+            if not genre_change:
+                r['status'] = 'Lookup complete — genre unchanged'
             return
-        lines = '\n'.join(f'{COLUMN_LABELS.get(k,k)}: {r.get(k) or "(blank)"} → {v} '
-                          f'({r.get("field_confidence",{}).get("subgenre" if k=="composer" else k, 0)}% estimated confidence)'
+        lines = '\n'.join(f'{COLUMN_LABELS.get(k,k)}: {r.get(k) or "(blank)"} → {v}'
                           for k,v in changes.items())
-        if not messagebox.askyesno('Confirm lookup metadata write',
+        if not messagebox.askyesno('Confirm other metadata changes',
                 f'{Path(path).name}\n\n{lines}\n\n'
-                'Write these fields to the actual audio file?\n'
+                'Write these non-genre fields to the audio file?\n'
                 'The original is backed up and can be restored from Write History.',
                 parent=self.root):
-            r['status'] = 'Lookup proposal — write declined'
+            r['status'] = 'Genre handled; other changes declined'
             return
         try:
             safe_write(path, changes, {}, write_any_tags, read_any_track,
                        self.data_dir / 'metadata_recovery', expected=r.get('disk_fingerprint'))
             r.update(read_any_track(path))
             r['disk_fingerprint'] = fingerprint(path)
-            for field in ('year','genre','subgenre'):
+            for field in ('year','subgenre'):
                 r.pop('suggested_'+field,None)
-            r['status'] = 'Tags written in place'
+            r['status'] = 'Metadata written in place'
             r['written'] = True
             self.undo_stack.clear(); self.redo_stack.clear()
             self.persist_library()

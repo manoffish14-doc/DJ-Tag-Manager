@@ -46,6 +46,9 @@ class DurableQueue:
         if not files:
             raise ValueError('No tracks selected')
         with self.connect() as db:
+            for existing_id, existing_files in db.execute("SELECT id,files FROM jobs WHERE kind=? AND state IN ('waiting','running')", (kind,)).fetchall():
+                if set(json.loads(existing_files)) == set(files):
+                    return existing_id
             priority = db.execute('SELECT COALESCE(MAX(priority),0)+1 FROM jobs').fetchone()[0]
             cur = db.execute('INSERT INTO jobs(kind,files,created,priority) VALUES(?,?,?,?)',
                              (kind, json.dumps(files), utcnow(), priority))
@@ -69,7 +72,7 @@ class DurableQueue:
         with self.cv:
             self.cancelled.add(job_id)
             with self.connect() as db:
-                db.execute("UPDATE jobs SET state='cancelled',ended=? WHERE id=? AND state='waiting'",(utcnow(),job_id))
+                db.execute("UPDATE jobs SET state='cancelled',ended=? WHERE id=? AND state IN ('waiting','running')",(utcnow(),job_id))
             self.cv.notify_all()
 
     def move(self, job_id, delta):
@@ -129,17 +132,23 @@ class DurableQueue:
                         result=self.execute(kind,path)
                         # Commit cursor only after callback has completed; downstream UI
                         # result processing is idempotent and does not write music files.
-                        successes+=1
-                        self.emit(('queue_result',job_id,kind,path,result))
+                        with self.cv:
+                            is_cancelled = job_id in self.cancelled or self.shutdown
+                        if not is_cancelled:
+                            successes+=1
+                            self.emit(('queue_result',job_id,kind,path,result))
+                        else:
+                            cancelled=True
                 except Exception as exc:
                     errors.append({'path':path,'error':str(exc)[:300]})
                     self.emit(('queue_skip',job_id,path,str(exc)[:120]))
                 with self.connect() as db:
-                    db.execute('UPDATE jobs SET cursor=?,successes=?,skipped=?,errors=? WHERE id=?',
+                    db.execute("UPDATE jobs SET cursor=?,successes=?,skipped=?,errors=? WHERE id=? AND state='running'",
                                (idx+1,successes,skipped,json.dumps(errors),job_id))
+                if cancelled: break
                 self.emit(('queue_progress',job_id,idx+1,len(paths)))
             with self.connect() as db:
-                db.execute('UPDATE jobs SET state=?,ended=? WHERE id=?',
+                db.execute("UPDATE jobs SET state=?,ended=? WHERE id=? AND state='running'",
                            ('waiting' if self.shutdown else ('cancelled' if cancelled else 'completed'),
                             None if self.shutdown else utcnow(),job_id))
             self.emit(('queue_done',job_id,kind,cancelled))

@@ -20,7 +20,6 @@ class IntegratedWorkflows:
         self.task_label.pack(side='left',padx=8)
         ttk.Button(self.task_bar,text='Queue…',command=self.queue_dialog).pack(side='right',padx=5)
         self.task_bar.pack(fill='x',before=self.status)
-        self.task_bar.pack_forget()
         self._last_backup=None
         self.root.after(3000,self._backup_tick)
         self.root.after(700,self._queue_tick)
@@ -56,12 +55,15 @@ class IntegratedWorkflows:
             snapshot=self.queue_engine.snapshot(40)
             active=[j for j in snapshot if j['state'] in ('waiting','running')]
             if active:
-                self.task_bar.pack(fill='x',before=self.status)
                 running=next((j for j in active if j['state']=='running'),active[0])
-                self.task_label.configure(text=f"{running['kind'].title()} {running['cursor']}/{running['total']} · {len(active)} task(s) · {'Paused' if self.queue_engine.paused else 'Active'}")
-            else:self.task_bar.pack_forget()
+                self.task_label.configure(text=f"{self._task_name(running['kind'])} · {running['cursor']}/{running['total']} tracks · {len(active)} queued/running · {'Paused' if self.queue_engine.paused else 'Active'}")
+            else:self.task_label.configure(text='Background Operations · Ready')
         except Exception:pass
         self.root.after(700,self._queue_tick)
+
+    @staticmethod
+    def _task_name(kind):
+        return {'lookup':'Finding Tags & Art','lookup_analyze':'Finding Tags & Art + Audio Analysis','analyze':'Analyzing BPM','analyze_metadata':'Analyzing BPM & Key'}.get(kind, kind.replace('_',' ').title())
 
     def queue_dialog(self):
         win=tk.Toplevel(self.root);win.title('Background Task Queue');win.geometry('850x530')
@@ -75,7 +77,7 @@ class IntegratedWorkflows:
             rows=self.queue_engine.snapshot()
             tree.delete(*tree.get_children())
             for j in rows:
-                tree.insert('','end',iid=str(j['id']),values=(j['kind'],f"{j['cursor']}/{j['total']}",j['state'],j['successes'],len(j['errors'])))
+                tree.insert('','end',iid=str(j['id']),values=(self._task_name(j['kind']),f"{j['cursor']}/{j['total']}",j['state'],j['successes'],len(j['errors'])))
             win.after(1000,refresh)
         refresh()
         controls=ttk.Frame(holder);controls.pack(fill='x',pady=10)
@@ -84,7 +86,7 @@ class IntegratedWorkflows:
         ttk.Button(controls,text='Cancel Selected',command=lambda:self.queue_engine.cancel(selected_id()) if selected_id() else None).pack(side='left',padx=3)
         ttk.Button(controls,text='Move Up',command=lambda:self.queue_engine.move(selected_id(),-1) if selected_id() else None).pack(side='left',padx=3)
         ttk.Button(controls,text='Move Down',command=lambda:self.queue_engine.move(selected_id(),1) if selected_id() else None).pack(side='left',padx=3)
-        ttk.Label(holder,text='Running tasks finish their current file before pausing or stopping. Queued work resumes on restart.',style='Muted.TLabel').pack(anchor='w')
+        ttk.Label(holder,text='Cancel marks the task immediately. An in-flight network request may take up to its timeout to stop; cancelled results are discarded.',style='Muted.TLabel').pack(anchor='w')
 
     def _build_sidebar_additions(self):
         for name,fn in [('Advanced Settings',self.advanced_settings),('Smart Filter Builder',self.smart_filter_builder),('Task Queue',self.queue_dialog),('Backup Now',self.backup_now),('Metadata Write History',self.metadata_write_history_dialog)]:
