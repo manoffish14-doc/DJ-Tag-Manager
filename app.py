@@ -2309,70 +2309,9 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
         threading.Thread(target=worker,daemon=True).start()
 
     def genre_cleanup(self):
-        """Manual genre cleanup. Group names write to Label/TPUB only on explicit Save."""
-        win=tk.Toplevel(self.root);win.title('Genre Cleanup');win.geometry('860x650')
-        win.configure(bg=COLORS['bg'])
-        ttk.Label(win,text='Genre Cleanup — Manual Changes Only',style='Brand.TLabel').pack(pady=12)
-        ttk.Label(win,text='Select a genre, rename it, and assign a grouping (Label). Nothing changes until Save.').pack(pady=4)
-        genres={}
-        for path,row in self.rows.items():
-            genre=str(display_value(row,'genre')).strip()
-            if genre:genres.setdefault(genre,[]).append(path)
-        container=ttk.Frame(win);container.pack(fill='both',expand=True,padx=15,pady=10)
-        listbox=tk.Listbox(container,bg=COLORS['panel'],fg=COLORS['text'],font=('Helvetica',13))
-        listbox.pack(side='left',fill='both',expand=True)
-        right=ttk.Frame(container);right.pack(side='left',fill='y',padx=15)
-        rename=tk.StringVar();group=tk.StringVar()
-        ttk.Label(right,text='Genre name').pack(anchor='w')
-        ttk.Entry(right,textvariable=rename,width=28).pack(pady=(3,12))
-        ttk.Label(right,text='Grouping (stored as Label)').pack(anchor='w')
-        ttk.Entry(right,textvariable=group,width=28).pack(pady=3)
-        ttk.Label(right,text='Create a grouping by typing its name.').pack(pady=8)
-        pending={}
-        keys=sorted(genres,key=str.casefold)
-        def redraw():
-            listbox.delete(0,'end')
-            for k in keys:
-                n,g=pending.get(k,(k,self.genre_groups.get(k,'')))
-                listbox.insert('end',f'{k} ({len(genres[k])})   →   {n}  [{g or "No group"}]')
-        def selection(_=None):
-            if not listbox.curselection():return
-            key=keys[listbox.curselection()[0]]
-            n,g=pending.get(key,(key,self.genre_groups.get(key,'')))
-            rename.set(n);group.set(g)
-        def stage():
-            if not listbox.curselection():return
-            key=keys[listbox.curselection()[0]]
-            if not rename.get().strip():return messagebox.showwarning(APP_NAME,'Genre cannot be empty.',parent=win)
-            pending[key]=(rename.get().strip(),group.get().strip());redraw()
-        def save():
-            stage()
-            changes=[];conflicts=[]
-            for old,(new,grouping) in pending.items():
-                for path in genres[old]:
-                    row=self.rows[path]
-                    if grouping and row.get('publisher') and row['publisher']!=grouping:
-                        conflicts.append(path)
-                    changes.append((path,new,grouping))
-            if conflicts and not messagebox.askyesno(APP_NAME,
-                f'{len(set(conflicts))} tracks already have a record label. Replace that Label with the genre grouping?',parent=win):return
-            if not changes:return win.destroy()
-            self.push_undo()
-            for path,new,grouping in changes:
-                row=self.rows[path]
-                row.setdefault('pending_tags',{})['genre']=new
-                if grouping:row['pending_tags']['publisher']=grouping
-                row['status']='Genre Cleanup — pending save'
-                self.refresh(path)
-            for old,(new,grouping) in pending.items():
-                if grouping:self.genre_groups[new]=grouping
-            self.save_preferences()
-            win.destroy()
-            messagebox.showinfo(APP_NAME,f'{len(set(p for p,_,_ in changes))} tracks staged. Click Save Changes to write MP3s.')
-        listbox.bind('<<ListboxSelect>>',selection)
-        ttk.Button(right,text='Rename / Assign',command=stage).pack(fill='x',pady=10)
-        ttk.Button(right,text='Save Cleanup',style='Accent.TButton',command=save).pack(fill='x')
-        redraw()
+        """Open the integrated Genre Cleanup workspace, never the legacy popup."""
+        from genre_workspace import open_genre_workspace
+        open_genre_workspace(self)
 
     def export(self):
         paths = [p for p in self.selected() if self.rows[p].get('cues')]

@@ -13,7 +13,7 @@ def inventory(rows, custom=()):
         name = str(row.get('genre') or '').strip()
         if name:
             result[name].append(path)
-    for name in custom:
+    for name in (*DEFAULT_GROUPS, *custom):
         if name:
             result.setdefault(name, [])
     return dict(result)
@@ -158,7 +158,13 @@ def open_genre_workspace(app):
         if selected_group.get() != 'All Genres':
             organization[name] = selected_group.get()
         app.save_preferences()
+        selected_group.set('All Genres')
         redraw()
+        if name in shown_genres:
+            genre_list.selection_clear(0, 'end')
+            genre_list.selection_set(shown_genres.index(name))
+            genre_list.see(shown_genres.index(name))
+            update_tracks()
 
     def move_genres():
         names = chosen()
@@ -237,7 +243,7 @@ def open_genre_workspace(app):
     group_buttons.pack(fill='x')
     ttk.Button(group_buttons, text='+ New Group', command=add_group).pack(side='left', padx=3)
     ttk.Button(group_buttons, text='Rename Group', command=rename_group).pack(side='left', padx=3)
-    ttk.Button(group_buttons, text='+ New Genre', command=add_genre).pack(side='left', padx=3)
+    ttk.Button(group_buttons, text='+ Add Genre', command=add_genre).pack(side='left', padx=3)
     ttk.Label(group_buttons, text='Move selected genres to:').pack(side='left', padx=(14, 5))
     group_combo = ttk.Combobox(group_buttons, textvariable=destination, values=list(DEFAULT_GROUPS) + list(custom_groups), width=17)
     group_combo.pack(side='left')
