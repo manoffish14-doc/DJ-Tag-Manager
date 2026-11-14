@@ -1,20 +1,21 @@
 """Public GitHub Releases updater for DJ Tag Manager (Apple Silicon)."""
 import hashlib
-import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import plistlib
+import re
+import zipfile
 import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 from urllib.parse import urlparse
-from importlib.metadata import version as pkg_version
 import requests
 
 REPO = 'manoffish14-doc/DJ-Tag-Manager'
-VERSION = '3.0.1'
+VERSION = '3.0.2'
 ZIP_NAME = 'DJ-Tag-Manager-Mac.zip'
 CHECKSUM_NAME = ZIP_NAME + '.sha256'
 
@@ -42,8 +43,24 @@ def _download(url, destination):
                     output.write(chunk)
 
 
+def _running_app():
+    """Resolve the actual running PyInstaller .app, never a guessed /Applications path."""
+    executable = Path(sys.executable).resolve()
+    candidates = [p for p in executable.parents if p.suffix == '.app']
+    if not candidates:
+        raise RuntimeError('Updater only works when running from the packaged Mac application.')
+    app = candidates[0]
+    if app.name != 'DJ Tag Manager.app':
+        raise RuntimeError('Unexpected application name; refusing to replace another app.')
+    info = plistlib.loads((app / 'Contents' / 'Info.plist').read_bytes())
+    if info.get('CFBundleIdentifier') != 'com.djtagmanager.app':
+        raise RuntimeError('Unexpected application identity; update cancelled.')
+    return app
+
+
 def _install_worker(release, assets, root, status, button):
     try:
+        destination = _running_app()  # Validate before any download.
         base = Path(tempfile.mkdtemp(prefix='djtag-update-'))
         archive = base / ZIP_NAME
         checksum = base / CHECKSUM_NAME
@@ -51,22 +68,37 @@ def _install_worker(release, assets, root, status, button):
         _download(assets[CHECKSUM_NAME]['browser_download_url'], checksum)
         expected = checksum.read_text().strip().split()[0].lower()
         actual = hashlib.sha256(archive.read_bytes()).hexdigest()
-        if len(expected) != 64 or expected != actual:
+        if not re.fullmatch(r'[0-9a-f]{64}', expected) or expected != actual:
             raise ValueError('Update checksum verification failed. Nothing was installed.')
-        helper = Path(__file__).with_name('update_helper.py')
+        # Validate archive paths before using macOS ditto to preserve bundle symlinks.
+        with zipfile.ZipFile(archive) as z:
+            for item in z.infolist():
+                parts = Path(item.filename).parts
+                if item.filename.startswith('/') or '..' in parts:
+                    raise ValueError('Unsafe path in update archive.')
+        extracted = base / 'extracted'
+        extracted.mkdir()
+        subprocess.run(['/usr/bin/ditto', '-x', '-k', str(archive), str(extracted)], check=True)
+        incoming = extracted / 'DJ Tag Manager.app'
+        info = plistlib.loads((incoming / 'Contents' / 'Info.plist').read_bytes())
+        if info.get('CFBundleIdentifier') != 'com.djtagmanager.app':
+            raise ValueError('Downloaded app has an unexpected bundle identifier.')
+        helper = Path(getattr(sys, '_MEIPASS', Path(__file__).parent)) / 'update_helper.sh'
         if not helper.exists():
-            raise FileNotFoundError('Update helper is missing from the application.')
-        # Copy outside the app bundle so it can run after the app quits.
-        helper_copy = base / 'update_helper.py'
-        helper_copy.write_bytes(helper.read_bytes())
-        script = [sys.executable, str(helper_copy), str(archive), str(os.getpid()), str(base)]
-        # A bundled GUI executable is not a Python interpreter; use macOS system Python.
-        script[0] = '/usr/bin/python3'
-        subprocess.Popen(script, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            raise FileNotFoundError('Bundled update_helper.sh is missing.')
+        backup = destination.with_name('DJ Tag Manager.previous.app')
+        pending = destination.with_name('DJ Tag Manager.incoming.app')
+        if backup.exists() or pending.exists():
+            raise RuntimeError('A previous backup or pending update exists next to the app. Resolve it before updating.')
+        log = base / 'install.log'
+        subprocess.Popen(['/bin/bash', str(helper), str(destination), str(incoming), str(os.getpid()), str(log)],
+                         start_new_session=True, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         root.after(0, root.destroy)
     except Exception as exc:
+        message = str(exc)
         root.after(0, lambda: (status.config(text='Update failed.'), button.config(state='normal'),
-                               messagebox.showerror('Update failed', str(exc))))
+                               messagebox.showerror('Update failed', message)))
 
 
 def show_update_dialog(root):
@@ -82,7 +114,7 @@ def show_update_dialog(root):
     def checked():
         try:
             release, assets = check_release()
-            tag = release.get('tag_name', '').lstrip('v')
+            tag = release.get('tag_name', '').removeprefix('v')
             def display():
                 if release.get('prerelease') or release.get('draft'):
                     status.config(text='Latest release is a draft or prerelease; no update offered.')
