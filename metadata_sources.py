@@ -66,6 +66,7 @@ def lastfm(artist,title,key):
     data=get('https://ws.audioscrobbler.com/2.0/', {'method':'track.getTopTags','artist':artist,'track':title,'autocorrect':1,'api_key':key,'format':'json'})
     if data.get('error'):raise ValueError(data.get('message','Last.fm error'))
     tags=data.get('toptags',{}).get('tag',[])
+    if isinstance(tags, dict): tags=[tags]
     return {'source':'Last.fm','tags':[t['name'] for t in tags[:12] if t.get('name')], 'year':None}
 
 def discogs(artist,title,token):

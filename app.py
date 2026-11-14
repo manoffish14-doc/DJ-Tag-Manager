@@ -1,5 +1,8 @@
 """DJ Tag Manager: local macOS-friendly MP3 metadata editor."""
 import json
+import base64
+import struct
+import zlib
 import subprocess
 import re
 import shutil
@@ -44,21 +47,28 @@ def apply_dark_theme(root):
     style.configure('Muted.TLabel', background=COLORS['bg'], foreground=COLORS['muted'])
     style.configure('Brand.TLabel', background=COLORS['bg'], foreground=COLORS['accent'],
                     font=('Helvetica Neue', 23, 'bold'))
-    # Rounded button surfaces using native Tk photo-image 9-slice elements.
-    # Images stay attached to the root so Tk does not garbage-collect them.
-    def rounded_image(color, radius=9, size=26):
-        pic = tk.PhotoImage(master=root, width=size, height=size)
-        pic.put(color, to=(radius, 0, size-radius, size))
+    # Tk's standard ttk clam buttons have square corners. Build an actual
+    # transparent RGBA PNG and use its center as a stretchable 9-slice element.
+    # No third-party imaging dependency is needed in the Mac bundle.
+    def rounded_image(color, radius=10, size=32):
+        rgb = tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))
+        rows = []
         for y in range(size):
+            pixels = bytearray()
             for x in range(size):
-                if (x < radius or x >= size-radius) and (y < radius or y >= size-radius):
-                    cx = radius if x < radius else size-radius-1
-                    cy = radius if y < radius else size-radius-1
-                    if (x-cx)**2 + (y-cy)**2 <= radius**2:
-                        pic.put(color, (x, y))
-                elif radius <= y < size-radius:
-                    pic.put(color, (x, y))
-        return pic
+                cx = max(radius - 0.5, min(x, size - radius - 0.5))
+                cy = max(radius - 0.5, min(y, size - radius - 0.5))
+                distance = ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5
+                alpha = max(0, min(255, int((radius + 0.5 - distance) * 255)))
+                pixels.extend((*rgb, alpha))
+            rows.append(b'\x00' + bytes(pixels))
+        def chunk(kind, data):
+            return struct.pack('!I', len(data)) + kind + data + struct.pack('!I', zlib.crc32(kind + data) & 0xffffffff)
+        png = (b'\x89PNG\r\n\x1a\n' +
+               chunk(b'IHDR', struct.pack('!2I5B', size, size, 8, 6, 0, 0, 0)) +
+               chunk(b'IDAT', zlib.compress(b''.join(rows))) +
+               chunk(b'IEND', b''))
+        return tk.PhotoImage(master=root, data=base64.b64encode(png).decode('ascii'))
 
     images = [rounded_image(COLORS[c]) for c in ('raised', 'hover', 'accent', 'accent_hover')]
     root._dj_rounded_images = images
@@ -66,7 +76,7 @@ def apply_dark_theme(root):
                                 ('DJAccentRound', images[2], images[3])]:
         style.element_create(name, 'image', normal,
                              ('pressed', hover), ('active', hover),
-                             border=11, sticky='nsew')
+                             border=12, sticky='nsew')
         style.layout(('Accent.TButton' if name == 'DJAccentRound' else 'TButton'),
                      [(name, {'sticky': 'nswe', 'children':
                        [('Button.padding', {'sticky': 'nswe', 'children':
@@ -400,7 +410,7 @@ def apply_tag_changes(path, changes, custom_changes):
 class App:
     def __init__(self, root):
         self.root = root
-        root.title(APP_NAME + ' 1.8')
+        root.title(APP_NAME + ' 2.0')
         root.geometry('1300x780')
         root.minsize(1050, 650)
         apply_dark_theme(root)
@@ -1067,10 +1077,10 @@ class App:
                         else:
                             r.pop(key, None)
                     r['lookup_debug'] = result.get('lookup_debug', {})
-                    r['sources'] = result['sources']
-                    r['lookup_warnings'] = result['errors']
-                    r['match'] = str(result['score'])
-                    r['status'] = 'Lookup: ' + ', '.join(result['sources']) if result['sources'] else 'No match'
+                    r['sources'] = result.get('sources', [])
+                    r['lookup_warnings'] = result.get('errors', [])
+                    r['match'] = str(result.get('score', ''))
+                    r['status'] = 'Lookup: ' + ', '.join(result.get('sources', [])) if result.get('sources') else 'No match'
                 else:
                     r['bpm'] = result['bpm']
                     if not r.get('bpm_tag'):
