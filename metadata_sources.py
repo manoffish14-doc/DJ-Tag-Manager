@@ -30,7 +30,14 @@ def musicbrainz(artist,title):
     if not recs:return None
     best=max(recs,key=lambda x:x.get('score',0))
     years=[int(r['first-release-date'][:4]) for r in recs if re.match(r'^\d{4}',r.get('first-release-date',''))]
+    # Search results often omit genre tags. Fetch the recording directly.
     tags=best.get('tags',[]) or best.get('genres',[])
+    if not tags and best.get('id'):
+        try:
+            details=get('https://musicbrainz.org/ws/2/recording/'+best['id'], {'inc':'genres+tags','fmt':'json'})
+            tags=details.get('genres',[]) or details.get('tags',[])
+        except (requests.RequestException, ValueError):
+            pass
     return {'source':'MusicBrainz','year':min(years) if years else None,'tags':[x['name'] for x in sorted(tags,key=lambda t:t.get('count',0),reverse=True) if x.get('name')], 'confidence':best.get('score',0)}
 
 def lastfm(artist,title,key):
@@ -108,6 +115,7 @@ def lookup(artist,title,config):
     for name in ('Last.fm','Discogs','MusicBrainz'):
         tags.extend(t for r in results if r['source']==name for t in r.get('tags',[]))
     genre,subgenre=classify(tags)
+    # When only a broad tag is available, don't invent a specific subgenre.
     return {'year':str(min(years)) if years else '', 'genre':genre,'subgenre':subgenre,
             'sources':[r['source'] for r in results], 'errors':errors,'tags':tags[:20],
             'score':'Review', 'error': 'No matching metadata found.' if not results else None}

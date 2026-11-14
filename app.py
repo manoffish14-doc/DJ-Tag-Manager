@@ -22,7 +22,106 @@ except ImportError:
     DND_FILES = None
     TkinterDnD = None
 
-APP_NAME = 'DJ Tag Manager' 
+# DJ Tag Manager visual system: charcoal surfaces, warm yellow highlights.
+COLORS = {
+    'bg': '#0B0E13', 'panel': '#141922', 'raised': '#1C2330',
+    'hover': '#293241', 'line': '#303947', 'text': '#F3F5F8',
+    'muted': '#A6B0BF', 'accent': '#FFD23F', 'accent_hover': '#FFE17B',
+    'select': '#4C411C', 'input': '#10151D',
+}
+
+
+def apply_dark_theme(root):
+    """Use the built-in ttk clam engine; no extra packages or Mac setup."""
+    style = ttk.Style(root)
+    style.theme_use('clam')
+    root.configure(background=COLORS['bg'])
+    style.configure('.', background=COLORS['bg'], foreground=COLORS['text'],
+                    font=('Helvetica', 11))
+    style.configure('TFrame', background=COLORS['bg'])
+    style.configure('Panel.TFrame', background=COLORS['panel'])
+    style.configure('TLabel', background=COLORS['bg'], foreground=COLORS['text'])
+    style.configure('Muted.TLabel', background=COLORS['bg'], foreground=COLORS['muted'])
+    style.configure('Brand.TLabel', background=COLORS['bg'], foreground=COLORS['accent'],
+                    font=('Helvetica', 19, 'bold'))
+    style.configure('TButton', background=COLORS['raised'], foreground=COLORS['text'],
+                    borderwidth=0, padding=(13, 9), relief='flat',
+                    font=('Helvetica', 10, 'bold'))
+    style.map('TButton', background=[('pressed', COLORS['hover']),
+                                     ('active', COLORS['hover'])],
+              foreground=[('disabled', COLORS['muted'])])
+    style.configure('Accent.TButton', background=COLORS['accent'],
+                    foreground=COLORS['bg'], padding=(15, 9))
+    style.map('Accent.TButton', background=[('active', COLORS['accent_hover']),
+                                            ('pressed', COLORS['accent_hover'])],
+              foreground=[('active', COLORS['bg'])])
+    style.configure('TEntry', fieldbackground=COLORS['input'],
+                    foreground=COLORS['text'], insertcolor=COLORS['accent'],
+                    bordercolor=COLORS['line'], lightcolor=COLORS['line'],
+                    darkcolor=COLORS['line'], padding=7)
+    style.map('TEntry', bordercolor=[('focus', COLORS['accent'])],
+              lightcolor=[('focus', COLORS['accent'])])
+    style.configure('Treeview', background=COLORS['panel'],
+                    fieldbackground=COLORS['panel'], foreground=COLORS['text'],
+                    rowheight=34, borderwidth=0, relief='flat',
+                    font=('Helvetica', 11))
+    style.map('Treeview', background=[('selected', COLORS['select'])],
+              foreground=[('selected', COLORS['accent'])])
+    style.configure('Treeview.Heading', background=COLORS['raised'],
+                    foreground=COLORS['muted'], padding=(12, 11),
+                    borderwidth=0, relief='flat', font=('Helvetica', 10, 'bold'))
+    style.map('Treeview.Heading', background=[('active', COLORS['hover'])],
+              foreground=[('active', COLORS['accent'])])
+    style.configure('TScrollbar', background=COLORS['raised'],
+                    troughcolor=COLORS['bg'], borderwidth=0, arrowcolor=COLORS['muted'])
+    style.configure('TCheckbutton', background=COLORS['bg'], foreground=COLORS['text'])
+    style.map('TCheckbutton', background=[('active', COLORS['bg'])],
+              foreground=[('active', COLORS['accent'])])
+    style.configure('TSeparator', background=COLORS['line'])
+    return style
+
+
+def style_popup(window):
+    window.configure(bg=COLORS['bg'])
+
+
+def style_plain_widget(widget):
+    if isinstance(widget, tk.Text):
+        widget.configure(bg=COLORS['panel'], fg=COLORS['text'],
+                         insertbackground=COLORS['accent'],
+                         selectbackground=COLORS['select'],
+                         relief='flat', highlightthickness=1,
+                         highlightbackground=COLORS['line'], padx=12, pady=10,
+                         font=('Menlo', 10))
+    elif isinstance(widget, tk.Listbox):
+        widget.configure(bg=COLORS['panel'], fg=COLORS['text'],
+                         selectbackground=COLORS['select'],
+                         selectforeground=COLORS['accent'],
+                         highlightthickness=0, relief='flat',
+                         font=('Helvetica', 11))
+    elif isinstance(widget, tk.Canvas):
+        widget.configure(bg=COLORS['bg'])
+
+APP_NAME = 'DJ Tag Manager'
+MIN_ANALYZED_BPM = 50.0
+MAX_ANALYZED_BPM = 160.0
+
+def normalize_analyzed_bpm(tempo, minimum=MIN_ANALYZED_BPM, maximum=MAX_ANALYZED_BPM):
+    """Keep tempo within bounds by octave shifts (half/double time)."""
+    import math
+    value = float(tempo)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError('No valid BPM detected')
+    while value < minimum:
+        value *= 2
+    while value > maximum:
+        value /= 2
+    if not minimum <= value <= maximum:
+        raise ValueError('Detected BPM cannot be represented in the configured range')
+    # Round halves up (rather than Python's ties-to-even round).
+    # Values are positive after validation.
+    return math.floor(value + 0.5)
+
 USER_AGENT = 'DJTagManager/0.1 (local desktop application)'
 
 
@@ -36,8 +135,7 @@ COLUMN_LABELS = {
     'isrc': 'ISRC', 'copyright': 'Copyright', 'encoded_by': 'Encoded By',
     'duration_display': 'Duration', 'bitrate': 'Bitrate', 'sample_rate': 'Sample Rate',
     'filename': 'Filename', 'folder': 'Folder', 'path': 'File Path', 'match': 'Match',
-    'bpm': 'Analyzed BPM', 'status': 'Status', 'suggested_year': 'Suggested Year',
-    'suggested_genre': 'Suggested Genre', 'suggested_subgenre': 'Suggested Subgenre',
+    'bpm': 'Analyzed BPM', 'status': 'Status',
     'sources_display': 'Lookup Sources',
 }
 DEFAULT_COLUMNS = ('title', 'artist', 'year', 'genre', 'composer', 'match', 'bpm', 'status')
@@ -82,6 +180,11 @@ def inspect_metadata(path):
 def display_value(row, column):
     if column in row.get('pending_tags', {}):
         return row['pending_tags'][column]
+    # Display lookup proposals in the original columns without writing to disk.
+    if column in ('year', 'genre', 'composer'):
+        suggested = row.get({'composer': 'suggested_subgenre'}.get(column, 'suggested_' + column), '')
+        if suggested:
+            return suggested
     if column in ('title', 'artist'):
         return row.get('suggested_' + column, row.get(column, ''))
     if column == 'sources_display':
@@ -208,7 +311,7 @@ def analyze_cues(path):
                 candidates.append((f'Energy Rise {i}', t))
         if duration > 35:
             candidates.append(('Outro Region', max(0, duration - 24)))
-        return {'bpm': round(float(np.asarray(tempo).reshape(-1)[0]), 1),
+        return {'bpm': normalize_analyzed_bpm(np.asarray(tempo).reshape(-1)[0]),
                 'cues': [{'label': name, 'seconds': round(t, 2)} for name, t in candidates]}
     except Exception as exc:
         return {'error': str(exc)}
@@ -270,27 +373,47 @@ def apply_tag_changes(path, changes, custom_changes):
 class App:
     def __init__(self, root):
         self.root = root
-        root.title(APP_NAME + ' 1.0')
-        root.geometry('1040x650')
+        root.title(APP_NAME + ' 1.6')
+        root.geometry('1300x780')
+        root.minsize(1050, 650)
+        apply_dark_theme(root)
         self.rows = {}
         self.events = queue.Queue()
         self.busy = False
         self.config_path = Path.home() / 'Library' / 'Application Support' / 'DJ Tag Manager' / 'api_keys.json'
         self.config = self.load_config()
         self.auto_lookup = tk.BooleanVar(value=True)
+        self.save_names = tk.BooleanVar(value=False)
         self.layout_path = self.config_path.with_name('column_layout.json')
         self.visible_columns = self.load_column_layout()
-        toolbar = ttk.Frame(root, padding=10)
+        header = ttk.Frame(root, padding=(20, 17, 20, 8))
+        header.pack(fill='x')
+        ttk.Label(header, text='DJ  /  TAG MANAGER', style='Brand.TLabel').pack(side='left')
+        ttk.Label(header, text='  MUSIC LIBRARY  •  METADATA WORKSPACE',
+                  style='Muted.TLabel').pack(side='left', padx=(12, 0))
+        toolbar = ttk.Frame(root, padding=(16, 8, 16, 12))
         toolbar.pack(fill='x')
         for label, cmd in [('Add MP3s', self.add_files), ('Add Folder', self.add_folder),
-                           ('Lookup Selected', self.lookup), ('API Settings', self.settings), ('Analyze Cues', self.analyze),
+                           ('Lookup Selected', self.lookup), ('Analyze Cues', self.analyze),
                            ('Write Selected Tags', self.write), ('Export Cue Suggestions', self.export)]:
-            ttk.Button(toolbar, text=label, command=cmd).pack(side='left', padx=3)
+            ttk.Button(toolbar, text=label, command=cmd,
+                       style='Accent.TButton' if label == 'Write Selected Tags' else 'TButton').pack(side='left', padx=3)
         ttk.Button(toolbar, text='Suggest Artist / Title', command=self.suggest_split).pack(side='left', padx=3)
-        ttk.Button(toolbar, text='Choose Columns', command=self.choose_columns).pack(side='left', padx=3)
         ttk.Button(toolbar, text='All Metadata', command=self.all_metadata).pack(side='left', padx=3)
         ttk.Button(toolbar, text='Edit All Tags', command=self.edit_all_tags).pack(side='left', padx=3)
         ttk.Button(toolbar, text='Show in Finder', command=self.reveal_selected).pack(side='left', padx=3)
+        # Keep configuration out of the main toolbar. Each menu item opens its
+        # existing dialog or toggles a preference without modifying MP3 files.
+        self.settings_menu = tk.Menu(root, tearoff=False, bg=COLORS['panel'],
+                                     fg=COLORS['text'], activebackground=COLORS['select'],
+                                     activeforeground=COLORS['accent'], borderwidth=0)
+        self.settings_menu.add_command(label='API Settings…', command=self.settings)
+        self.settings_menu.add_command(label='Choose Columns…', command=self.choose_columns)
+        self.settings_menu.add_separator()
+        self.settings_menu.add_checkbutton(label='Auto lookup on import/drop', variable=self.auto_lookup)
+        self.settings_menu.add_checkbutton(label='Include artist/title when writing tags', variable=self.save_names)
+        self.settings_button = ttk.Button(toolbar, text='⚙ Settings', command=self.open_settings_menu)
+        self.settings_button.pack(side='right', padx=(8, 0))
         editor = ttk.Frame(root, padding=(10, 3))
         editor.pack(fill='x')
         ttk.Label(editor, text='Suggested artist:').pack(side='left')
@@ -301,11 +424,8 @@ class App:
         ttk.Entry(editor, textvariable=self.title_edit, width=37).pack(side='left', padx=4)
         ttk.Button(editor, text='Apply to selected row', command=self.apply_split).pack(side='left', padx=4)
         ttk.Label(editor, text='Double-click any editable tag cell').pack(side='left', padx=4)
-        self.save_names = tk.BooleanVar(value=False)
-        ttk.Checkbutton(editor, text='Also write artist/title to MP3', variable=self.save_names).pack(side='left')
-        ttk.Checkbutton(editor, text='Auto lookup on import/drop', variable=self.auto_lookup).pack(side='left', padx=5)
-        self.drop_label = ttk.Label(root, text='Drop MP3 files or folders here (or onto the song list)',
-                                    anchor='center', padding=14, relief='groove')
+        self.drop_label = ttk.Label(root, text='↓   DROP MP3 FILES OR FOLDERS HERE   •   AUTOMATIC LOOKUP ON IMPORT',
+                                    anchor='center', padding=17, style='Muted.TLabel')
         self.drop_label.pack(fill='x', padx=10, pady=(3, 3))
         self.dnd_available = False
         if DND_FILES and hasattr(root, 'drop_target_register'):
@@ -320,9 +440,17 @@ class App:
             self.drop_label.config(text='Drag and drop unavailable in this build; use Add MP3s / Add Folder')
         self.tree = ttk.Treeview(root, columns=tuple(COLUMN_LABELS), show='headings', selectmode='extended')
         self.configure_columns()
-        self.tree.pack(fill='both', expand=True, padx=10, pady=5)
+        self.tree.pack(fill='both', expand=True, padx=16, pady=(8, 6))
+        self.tree.tag_configure('odd', background=COLORS['panel'])
+        self.tree.tag_configure('even', background='#19202B')
         self.tree.bind('<<TreeviewSelect>>', self.show_details)
         self.tree.bind('<Double-1>', self.edit_song_cell)
+        self.tree.bind('<Button-2>', self.on_header_context_menu)
+        self.tree.bind('<Button-3>', self.on_header_context_menu)
+        self.tree.bind('<Control-Button-1>', self.on_header_context_menu)
+        self.tree.bind('<ButtonPress-1>', self.on_header_press, add='+')
+        self.tree.bind('<ButtonRelease-1>', self.on_header_release, add='+')
+        self._header_drag = None
         self.inline_editor = None
         if self.dnd_available and hasattr(self.tree, 'drop_target_register'):
             try:
@@ -330,11 +458,23 @@ class App:
                 self.tree.dnd_bind('<<Drop>>', self.on_drop)
             except tk.TclError as exc:
                 print(f'Song-list drag-and-drop unavailable: {exc}')
-        self.details = tk.Text(root, height=9, wrap='word')
-        self.details.pack(fill='x', padx=10, pady=5)
-        self.status = ttk.Label(root, text='Ready. Add MP3s or a folder.', padding=10)
+        self.details = tk.Text(root, height=7, wrap='word')
+        style_plain_widget(self.details)
+        self.details.pack(fill='x', padx=16, pady=(6, 5))
+        self.status = ttk.Label(root, text='●  Ready  •  Add MP3s or drop a folder to begin',
+                                padding=(20, 12), style='Muted.TLabel')
         self.status.pack(fill='x')
         root.after(100, self.poll)
+
+    def open_settings_menu(self):
+        # Anchor the popup to the gear button, rather than the mouse pointer.
+        self.root.update_idletasks()
+        x = self.settings_button.winfo_rootx()
+        y = self.settings_button.winfo_rooty() + self.settings_button.winfo_height()
+        try:
+            self.settings_menu.tk_popup(x, y)
+        finally:
+            self.settings_menu.grab_release()
 
     def configure_columns(self):
         self.tree.configure(displaycolumns=tuple(self.visible_columns))
@@ -363,6 +503,7 @@ class App:
     def choose_columns(self):
         """Choose and reorder visible columns without modifying any MP3 tags."""
         window = tk.Toplevel(self.root)
+        style_popup(window)
         window.title('Customize Song List Columns')
         window.geometry('560x610')
         ttk.Label(window, text='Check fields to display. Select a field and use Up / Down to change its position. Hidden tags are never deleted.',
@@ -372,6 +513,7 @@ class App:
         ordered = list(self.visible_columns) + [key for key in COLUMN_LABELS if key not in self.visible_columns]
         checked = {key: key in self.visible_columns for key in COLUMN_LABELS}
         listbox = tk.Listbox(outer, selectmode='browse', exportselection=False)
+        style_plain_widget(listbox)
         scrollbar = ttk.Scrollbar(outer, orient='vertical', command=listbox.yview)
         listbox.configure(yscrollcommand=scrollbar.set)
         listbox.pack(side='left', fill='both', expand=True)
@@ -423,7 +565,74 @@ class App:
         footer = ttk.Frame(window, padding=12)
         footer.pack(fill='x')
         ttk.Button(footer, text='Cancel', command=window.destroy).pack(side='right', padx=5)
-        ttk.Button(footer, text='Apply & Save Layout', command=apply).pack(side='right', padx=5)
+        ttk.Button(footer, text='Apply & Save Layout', style='Accent.TButton', command=apply).pack(side='right', padx=5)
+
+    def on_header_context_menu(self, event):
+        """Show the visibility checklist only when right-clicking a column header."""
+        if self.tree.identify_region(event.x, event.y) != 'heading':
+            return
+        menu = tk.Menu(self.tree, tearoff=False, bg=COLORS['panel'],
+                       fg=COLORS['text'], activebackground=COLORS['select'],
+                       activeforeground=COLORS['accent'])
+        menu.add_command(label='Show / Hide Columns', state='disabled')
+        menu.add_separator()
+        for key, label in COLUMN_LABELS.items():
+            selected = tk.BooleanVar(value=key in self.visible_columns)
+            menu.add_checkbutton(
+                label=label, variable=selected,
+                command=lambda k=key: self.toggle_column(k),
+            )
+        menu.add_separator()
+        menu.add_command(label='More column options…', command=self.choose_columns)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return 'break'
+
+    def toggle_column(self, key):
+        if key in self.visible_columns:
+            if len(self.visible_columns) == 1:
+                messagebox.showinfo(APP_NAME, 'At least one column must remain visible.')
+                return
+            self.visible_columns.remove(key)
+        else:
+            self.visible_columns.append(key)
+        self.tree.configure(displaycolumns=tuple(self.visible_columns))
+        self.save_column_layout()
+
+    def on_header_press(self, event):
+        if self.tree.identify_region(event.x, event.y) != 'heading':
+            self._header_drag = None
+            return
+        column = self.tree.identify_column(event.x)
+        try:
+            index = int(column[1:]) - 1
+        except (ValueError, IndexError):
+            return
+        if 0 <= index < len(self.visible_columns):
+            self._header_drag = (index, event.x, event.y)
+
+    def on_header_release(self, event):
+        drag = self._header_drag
+        self._header_drag = None
+        if drag is None or abs(event.x - drag[1]) < 12:
+            return
+        if self.tree.identify_region(event.x, event.y) != 'heading':
+            return
+        destination = self.tree.identify_column(event.x)
+        try:
+            target = int(destination[1:]) - 1
+        except (ValueError, IndexError):
+            return
+        source = drag[0]
+        if not (0 <= target < len(self.visible_columns)) or target == source:
+            return
+        field = self.visible_columns.pop(source)
+        self.visible_columns.insert(target, field)
+        self.tree.configure(displaycolumns=tuple(self.visible_columns))
+        self.save_column_layout()
+        return 'break'
 
     def all_metadata(self):
         """Show all existing ID3 frames, including nonstandard Serato frames, read-only."""
@@ -433,6 +642,7 @@ class App:
             return
         path = paths[0]
         window = tk.Toplevel(self.root)
+        style_popup(window)
         window.title('All Metadata — ' + Path(path).name)
         window.geometry('850x590')
         ttk.Label(window, text='Full file location: ' + path, wraplength=810).pack(anchor='w', padx=10, pady=5)
@@ -477,11 +687,13 @@ class App:
         path = paths[0]
         row = self.rows[path]
         window = tk.Toplevel(self.root)
+        style_popup(window)
         window.title('Edit Metadata — ' + Path(path).name)
         window.geometry('700x680')
         ttk.Label(window, text='File: ' + path, wraplength=660).pack(anchor='w', padx=12, pady=8)
         ttk.Label(window, text='Changes are staged until Write Selected Tags. Empty values clear tags. Binary/Serato frames remain read-only.', wraplength=660).pack(anchor='w', padx=12)
         canvas = tk.Canvas(window, highlightthickness=0)
+        style_plain_widget(canvas)
         scrollbar = ttk.Scrollbar(window, orient='vertical', command=canvas.yview)
         body = ttk.Frame(canvas)
         body.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
@@ -494,7 +706,7 @@ class App:
             line = ttk.Frame(body)
             line.pack(fill='x', pady=3)
             ttk.Label(line, text=COLUMN_LABELS.get(field, field), width=22).pack(side='left')
-            initial = row.get('pending_tags', {}).get(field, row.get('suggested_' + field, row.get(field, '')))
+            initial = display_value(row, field)
             var = tk.StringVar(value=initial)
             ttk.Entry(line, textvariable=var, width=58).pack(side='left', fill='x', expand=True)
             vars_[field] = var
@@ -542,7 +754,7 @@ class App:
             self.refresh(path)
             self.show_details()
             window.destroy()
-        ttk.Button(body, text='Stage Changes', command=stage).pack(anchor='w', pady=12)
+        ttk.Button(body, text='Stage Changes', style='Accent.TButton', command=stage).pack(anchor='w', pady=12)
 
     def load_config(self):
         try:
@@ -552,6 +764,7 @@ class App:
 
     def settings(self):
         window = tk.Toplevel(self.root)
+        style_popup(window)
         window.title('Music Database API Settings')
         window.geometry('560x300')
         fields = [('lastfm', 'Last.fm API key'), ('discogs', 'Discogs personal access token'),
@@ -569,7 +782,7 @@ class App:
             self.config_path.write_text(json.dumps(self.config), encoding='utf-8')
             self.config_path.chmod(0o600)
             window.destroy()
-        ttk.Button(window, text='Save API Settings', command=save).grid(row=5, column=1, pady=12)
+        ttk.Button(window, text='Save API Settings', style='Accent.TButton', command=save).grid(row=5, column=1, pady=12)
 
     def add_files(self):
         self.add_paths(filedialog.askopenfilenames(filetypes=[('MP3 files', '*.mp3')]))
@@ -618,56 +831,71 @@ class App:
         self.show_details()
 
     def edit_song_cell(self, event):
-        """Double-click a Title or Artist cell to edit its proposed tag."""
-        region = self.tree.identify('region', event.x, event.y)
+        """Open a readable editor above the tree, never a tiny clipped cell overlay."""
+        if self.tree.identify_region(event.x, event.y) != 'cell':
+            return
         column = self.tree.identify_column(event.x)
         path = self.tree.identify_row(event.y)
-        if region != 'cell' or not path:
+        if not path:
             return
-        index = int(column[1:]) - 1
-        displayed = self.visible_columns
-        if index < 0 or index >= len(displayed) or displayed[index] not in EDITABLE_FIELDS:
+        try:
+            index = int(column[1:]) - 1
+        except (ValueError, IndexError):
             return
-        field = displayed[index]
-        key = 'suggested_' + field if field in ('title', 'artist') else field
-        row = self.rows[path]
+        if not (0 <= index < len(self.visible_columns)):
+            return
+        field = self.visible_columns[index]
+        if field not in EDITABLE_FIELDS:
+            return
         if self.inline_editor is not None:
             self.inline_editor.destroy()
             self.inline_editor = None
-        bbox = self.tree.bbox(path, column)
-        if not bbox:
-            return
-        x, y, width, height = bbox
-        entry = ttk.Entry(self.tree)
-        entry.insert(0, row.get('pending_tags', {}).get(field, row.get(key, row.get(field, ''))))
-        entry.place(x=x, y=y, width=width, height=height)
+        row = self.rows[path]
+        original = display_value(row, field)
+        window = tk.Toplevel(self.root)
+        style_popup(window)
+        self.inline_editor = window
+        window.title('Edit ' + COLUMN_LABELS[field])
+        window.geometry('780x170')
+        window.minsize(460, 150)
+        window.transient(self.root)
+        window.resizable(True, False)
+        window.columnconfigure(0, weight=1)
+        ttk.Label(window, text=f'{COLUMN_LABELS[field]} — {Path(path).name}',
+                  wraplength=730).grid(row=0, column=0, sticky='w', padx=16, pady=(12, 6))
+        value = tk.StringVar(value=str(original))
+        entry = ttk.Entry(window, textvariable=value, font=('Helvetica', 14))
+        entry.grid(row=1, column=0, sticky='ew', padx=16, pady=4, ipady=5)
         entry.focus_set()
         entry.select_range(0, tk.END)
-        self.inline_editor = entry
+        footer = ttk.Frame(window)
+        footer.grid(row=2, column=0, sticky='e', padx=16, pady=10)
         finished = [False]
 
         def finish(save):
             if finished[0]:
                 return
             finished[0] = True
-            new_text = entry.get().strip()
-            entry.destroy()
-            if self.inline_editor is entry:
+            new_text = value.get().strip()
+            if self.inline_editor is window:
                 self.inline_editor = None
+            window.destroy()
             if not save:
                 return
             row.setdefault('pending_tags', {})[field] = new_text
             if field in ('title', 'artist'):
-                row[key] = new_text
+                row['suggested_' + field] = new_text
                 self.save_names.set(True)
             row['status'] = f'Edited {field} — pending save'
             self.refresh(path)
             self.tree.selection_set(path)
             self.show_details()
 
+        ttk.Button(footer, text='Cancel', command=lambda: finish(False)).pack(side='right', padx=4)
+        ttk.Button(footer, text='Apply Edit', style='Accent.TButton', command=lambda: finish(True)).pack(side='right', padx=4)
         entry.bind('<Return>', lambda e: finish(True))
         entry.bind('<Escape>', lambda e: finish(False))
-        entry.bind('<FocusOut>', lambda e: finish(True))
+        window.protocol('WM_DELETE_WINDOW', lambda: finish(False))
 
     def add_paths(self, paths):
         errors = 0
@@ -705,7 +933,8 @@ class App:
         if self.tree.exists(path):
             self.tree.item(path, values=values)
         else:
-            self.tree.insert('', 'end', iid=path, values=values)
+            self.tree.insert('', 'end', iid=path, values=values,
+                             tags=('even' if len(self.rows) % 2 == 0 else 'odd',))
 
     def selected(self):
         return list(self.tree.selection())
@@ -751,9 +980,15 @@ class App:
                 if result.get('error'):
                     r['status'] = result['error'][:65]
                 elif kind == 'lookup':
-                    r['suggested_year'] = result['year']
-                    r['suggested_genre'] = result['genre']
-                    r['suggested_subgenre'] = result['subgenre']
+                    # Stage metadata for review; the Year/Genre/Composer columns
+                    # display these values immediately, but MP3s change only on Save.
+                    for field in ('year', 'genre', 'subgenre'):
+                        value = result.get(field, '')
+                        key = 'suggested_' + field
+                        if value:
+                            r[key] = value
+                        else:
+                            r.pop(key, None)
                     r['sources'] = result['sources']
                     r['lookup_warnings'] = result['errors']
                     r['match'] = str(result['score'])
