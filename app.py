@@ -28,6 +28,7 @@ from metadata_sources import lookup as multi_lookup
 from metadata_automation import proposal as metadata_proposal, field_confidence, analyze_audio, artwork_from_musicbrainz, write_mp3_cover_art
 from metadata_safety import safe_write, fingerprint, FileChangedError, history as metadata_history, restore_write
 from workspace_layout import sidebar_width, valid_column_filters
+from mac_feedback_fixes import MacFeedbackFixes
 from update_manager import show_update_dialog
 from mutagen.mp3 import MP3
 from mutagen import File as MutagenFile
@@ -475,7 +476,7 @@ from advanced_ui import AdvancedTools
 from integrated_workflows import IntegratedWorkflows
 from waveform_player import WaveformController
 
-class App(IntegratedWorkflows, AdvancedTools):
+class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
     def __init__(self, root):
         self.root = root
         root.title(APP_NAME + ' 3.1.0 Combined Development')
@@ -638,6 +639,7 @@ class App(IntegratedWorkflows, AdvancedTools):
         self.setup_advanced()
         self.setup_integrated()
         self._setup_sidebar_toggle()
+        self.install_mac_feedback_fixes()
         if self.filters:
             self.apply_filters()
         root.protocol('WM_DELETE_WINDOW', self.close_app)
