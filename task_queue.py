@@ -98,10 +98,15 @@ class DurableQueue:
                 if self.paused:
                     self.cv.wait(timeout=.4)
                     continue
-            with self.connect() as db:
-                job=db.execute("SELECT id,kind,files,cursor,successes,skipped,errors FROM jobs WHERE state='waiting' ORDER BY priority,id LIMIT 1").fetchone()
-                if job:
-                    db.execute("UPDATE jobs SET state='running',started=COALESCE(started,?) WHERE id=?",(utcnow(),job[0]))
+            # Claim under the same condition lock used by pause/reorder.
+            # Otherwise a job can start after pause(True) but before add().
+            with self.cv:
+                if self.paused or self.shutdown:
+                    continue
+                with self.connect() as db:
+                    job=db.execute("SELECT id,kind,files,cursor,successes,skipped,errors FROM jobs WHERE state='waiting' ORDER BY priority,id LIMIT 1").fetchone()
+                    if job:
+                        db.execute("UPDATE jobs SET state='running',started=COALESCE(started,?) WHERE id=?",(utcnow(),job[0]))
             if not job:
                 with self.cv: self.cv.wait(timeout=.5)
                 continue

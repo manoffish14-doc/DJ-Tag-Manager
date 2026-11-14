@@ -547,7 +547,6 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
         self.settings_menu.add_command(label='API Settings…', command=self.settings)
         self.settings_menu.add_command(label='Metadata Automation…', command=self.metadata_automation_settings)
         self.settings_menu.add_command(label='Find Cover Art for Selected MP3…', command=self.find_cover_art_selected)
-        self.settings_menu.add_command(label='Serato Integration…', command=self.serato_settings)
         self.settings_menu.add_command(label='Backup Library…', command=self.backup_library)
         self.settings_menu.add_command(label='Restore Library Backup…', command=self.restore_library_backup)
         self.settings_menu.add_command(label='Genre Lookup Diagnostics…', command=self.show_lookup_debug)
@@ -610,13 +609,14 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
         self.tree.bind('<Escape>', lambda e: self.tree.selection_remove(self.tree.selection()))
         # Keyboard actions are installed by IntegratedWorkflows so remapping is reliable.
         self.tree.bind('<Double-1>', self.play_clicked_song)
-        self.tree.bind('<Button-1>', self.maybe_edit_selected_cell, add='+')
         self.tree.bind('<Button-2>', self.on_header_context_menu)
         self.tree.bind('<Button-3>', self.on_header_context_menu)
         self.tree.bind('<Control-Button-1>', self.on_header_context_menu)
         self.tree.bind('<ButtonPress-1>', self.on_header_press, add='+')
         self.tree.bind('<ButtonRelease-1>', self.on_header_release, add='+')
         self.tree.bind('<Shift-Button-1>', self.on_shift_header_sort, add='+')
+        self.tree.bind('<space>', self._space_play_pause)
+        self.root.bind_all('<space>', self._space_play_pause, add='+')
         self._header_drag = None
         self.inline_editor = None
         if self.dnd_available and hasattr(self.tree, 'drop_target_register'):
@@ -720,8 +720,8 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
             self.sidebar_buttons[name] = button
         tk.Label(self.sidebar, text='LIBRARY TOOLS', bg='#15171B', fg=COLORS['accent'],
             font=('Helvetica', 11, 'bold')).pack(anchor='w', padx=14, pady=(15,5))
-        for name, action in [('Duplicates',self.find_duplicates),('Genre Cleanup',self.genre_cleanup),
-            ('Smart Filters',self.smart_filters),('Serato Settings',self.serato_settings),('Relocate Missing',self.relocate_missing)]:
+        for name, action in [('Duplicates',self.find_duplicates),('Genre Cleanup',self.genre_cleanup),('Name Cleanup',self.name_cleanup_review),
+            ('Smart Filters',self.smart_filters),('Relocate Missing',self.relocate_missing)]:
             tk.Button(self.sidebar, text=name, anchor='w', bg='#15171B', fg='#F5F5F5',
                 borderwidth=0, padx=14, pady=7, command=action).pack(fill='x')
         self.choose_view('All Tracks')
@@ -757,21 +757,38 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
         self.show_details()
 
     def build_player(self):
-        bar = tk.Frame(self.root, bg='#292D35', height=52)
-        bar.pack(fill='x', side='bottom', padx=12, pady=(0,5))
-        self.player_button = tk.Button(bar, text='▶', command=self.toggle_playback,
-            bg='#292D35', fg=COLORS['accent'], borderwidth=0, font=('Helvetica',16,'bold'))
-        self.player_button.pack(side='left', padx=12)
-        self.player_label = tk.Label(bar, text='No track loaded', bg='#292D35', fg='#F5F5F5',
-            font=('Helvetica',12), anchor='w')
+        # Two rows: waveform above track information and transport.
+        panel = tk.Frame(self.root, bg='#171A20', highlightthickness=0)
+        panel.pack(fill='x', side='bottom', padx=12, pady=(0, 5))
+        wave_row = tk.Frame(panel, bg='#22262E', height=78)
+        wave_row.pack(fill='x', padx=10, pady=(9, 3))
+        wave_row.pack_propagate(False)
+        self.waveform_controller = WaveformController(self, wave_row)
+        self.waveform_controller.wave.configure(height=65)
+        transport = tk.Frame(panel, bg='#171A20', height=49)
+        transport.pack(fill='x', padx=10, pady=(3, 9))
+        self.player_button = tk.Button(transport, text='▶', command=self.toggle_playback,
+            bg='#FACC15', fg='#171A20', activebackground='#FDE047', activeforeground='#171A20',
+            borderwidth=0, relief='flat', font=('Helvetica', 15, 'bold'), width=3)
+        self.player_button.pack(side='left', padx=(0, 12))
+        self.player_label = tk.Label(transport, text='No track loaded', bg='#171A20', fg='#F5F5F5',
+            font=('Helvetica', 12), anchor='w')
         self.player_label.pack(side='left', fill='x', expand=True)
-        self.waveform_controller=WaveformController(self,bar)
+        tk.Button(transport, text='Edit Metadata', command=self.edit_all_tags, bg='#30353E',
+                  fg='#F5F5F5', relief='flat', borderwidth=0).pack(side='right', padx=5)
 
     def update_player_label(self):
         if not hasattr(self, 'player_label'): return
         r = self.rows.get(self.player_path, {})
         self.player_label.configure(text=(f"{r.get('title',Path(self.player_path).stem)}  —  {r.get('artist','')}"
             if self.player_path else 'No track loaded'))
+
+    def _space_play_pause(self, event):
+        # Never intercept a space while the user is editing or typing.
+        if isinstance(event.widget, (tk.Entry, ttk.Entry, tk.Text, ttk.Combobox, tk.Spinbox)):
+            return None
+        self.toggle_playback()
+        return 'break'
 
     def play_clicked_song(self, event):
         self.last_double_click = time.monotonic()
@@ -810,7 +827,7 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
             args+=['-s',str(seconds)]
         args.append(self.player_path)
         try:
-            self.player_process=subprocess.Popen(args,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            self.player_process=subprocess.Popen(args,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
             self.player_button.configure(text='■')
             self.waveform_controller.start_position=seconds
             self.waveform_controller.position=seconds
@@ -1373,7 +1390,7 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
         window.title('Edit Metadata — ' + Path(path).name)
         window.geometry('700x680')
         ttk.Label(window, text='File: ' + path, wraplength=660).pack(anchor='w', padx=12, pady=8)
-        ttk.Label(window, text='Changes are staged until Write Selected Tags. Empty values clear tags. Binary/Serato frames remain read-only.', wraplength=660).pack(anchor='w', padx=12)
+        ttk.Label(window, text='Save Changes writes to the selected MP3 with a recovery backup. Empty values clear tags.', wraplength=660).pack(anchor='w', padx=12)
         canvas = tk.Canvas(window, highlightthickness=0)
         style_plain_widget(canvas)
         scrollbar = ttk.Scrollbar(window, orient='vertical', command=canvas.yview)
@@ -1381,6 +1398,15 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
         body.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
         canvas.create_window((0, 0), window=body, anchor='nw')
         canvas.configure(yscrollcommand=scrollbar.set)
+        def wheel_scroll(event):
+            delta = -1 if event.delta > 0 else 1
+            canvas.yview_scroll(delta * 3, 'units')
+            return 'break'
+        def bind_wheel(widget):
+            widget.bind('<MouseWheel>', wheel_scroll, add='+')
+            for child in widget.winfo_children():
+                bind_wheel(child)
+        window.after_idle(lambda: bind_wheel(body) if window.winfo_exists() else None)
         canvas.pack(side='left', fill='both', expand=True, padx=12, pady=8)
         scrollbar.pack(side='right', fill='y')
         vars_ = {}
@@ -1433,11 +1459,13 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
                 if name:
                     updates[name] = value_var.get().strip()
             row['pending_custom'] = {k: v for k, v in updates.items() if custom.get(k) != v}
-            row['status'] = 'Metadata edits staged — click Write Selected Tags'
+            row['status'] = 'Manual metadata edits ready to save'
             self.refresh(path)
             self.show_details()
             window.destroy()
-        ttk.Button(body, text='Stage Changes', style='Accent.TButton', command=stage).pack(anchor='w', pady=12)
+            self.tree.selection_set(path)
+            self.write()
+        ttk.Button(body, text='Save Changes', style='Accent.TButton', command=stage).pack(anchor='w', pady=12)
 
     def load_config(self):
         try:
