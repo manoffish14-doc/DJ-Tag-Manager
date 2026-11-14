@@ -1,15 +1,14 @@
-
 name: Build Mac App
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: macos-15
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -18,31 +17,27 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          architecture: 'arm64'
+          architecture: arm64
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
 
-       - name: Build Mac application
+      - name: Build Mac application
         run: |
-          pyinstaller --noconfirm --clean \
-            --windowed \
-            --name "DJ Tag Manager" \
+          pyinstaller --noconfirm --clean --windowed \
+            --name 'DJ Tag Manager' \
             --target-arch arm64 \
             --collect-all librosa \
             --collect-all tkinterdnd2 \
             app.py
 
-      
       - name: Package Mac application
         run: |
           cd dist
-          ditto -c -k --keepParent \
-            "DJ Tag Manager.app" \
-            "DJ-Tag-Manager-Mac.zip"
+          ditto -c -k --keepParent 'DJ Tag Manager.app' 'DJ-Tag-Manager-Mac.zip'
 
       - name: Upload Mac application
         uses: actions/upload-artifact@v4
@@ -50,5 +45,3 @@ jobs:
           name: DJ-Tag-Manager-Apple-Silicon
           path: dist/DJ-Tag-Manager-Mac.zip
           if-no-files-found: error
-
-
