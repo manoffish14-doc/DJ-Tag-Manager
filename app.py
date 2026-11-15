@@ -521,6 +521,7 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
         # The gear is in the header, not a horizontally overflowing toolbar.
         toolbar = ttk.Frame(root, padding=(16, 8, 16, 8))
         toolbar.pack(fill='x')
+        self.main_toolbar = toolbar
         self.toolbar_buttons = {}
         for label, cmd in [('Import Files', self.add_files), ('Import Folder', self.add_folder), ('Scan Library', self.scan_library),
                            ('Find Tags & Art', self.lookup), ('Analyze BPM', self.analyze),
@@ -766,9 +767,14 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
         # Two rows: waveform above track information and transport.
         panel = tk.Frame(self.root, bg='#171A20', highlightthickness=0)
         panel.pack(fill='x', side='bottom', padx=12, pady=(0, 5))
+        self.player_panel = panel
         wave_row = tk.Frame(panel, bg='#22262E', height=78)
         wave_row.pack(fill='x', padx=10, pady=(9, 3))
         wave_row.pack_propagate(False)
+        self.player_wave_row = wave_row
+        self.player_collapsed = False
+        self.player_collapse_button = tk.Label(panel, text='▾  Music Player', bg='#30353E', fg='#FACC15', cursor='hand2', anchor='w', padx=12, pady=5)
+        self.player_collapse_button.bind('<Button-1>', lambda _e: self.set_player_collapsed(not self.player_collapsed))
         self.waveform_controller = WaveformController(self, wave_row)
         self.waveform_controller.wave.configure(height=65)
         transport = tk.Frame(panel, bg='#171A20', height=49)
@@ -782,6 +788,17 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
         self.player_label.pack(side='left', fill='x', expand=True)
         tk.Button(transport, text='Edit Metadata', command=self.edit_all_tags, bg='#30353E',
                   fg='#F5F5F5', relief='flat', borderwidth=0).pack(side='right', padx=5)
+
+    def set_player_collapsed(self, collapsed):
+        """Collapse waveform without stopping playback or recreating the player."""
+        self.player_collapsed = bool(collapsed)
+        if collapsed:
+            self.player_wave_row.pack_forget()
+            self.player_collapse_button.configure(text='▸  Music Player — click to expand')
+            self.player_collapse_button.pack(fill='x', before=self.player_panel.winfo_children()[-1])
+        else:
+            self.player_collapse_button.pack_forget()
+            self.player_wave_row.pack(fill='x', padx=10, pady=(9, 3), before=self.player_panel.winfo_children()[-1])
 
     def update_player_label(self):
         if not hasattr(self, 'player_label'): return

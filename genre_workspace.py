@@ -47,6 +47,15 @@ def open_genre_workspace(app):
     if existing is not None and existing.winfo_exists():
         return
     table = app._library_table_frame
+    # Give Genre Cleanup the entire main workspace. Preserve widget instances
+    # and playback state so returning to Library is immediate.
+    hidden = []
+    for widget in (app.main_toolbar, app.drop_label, app.details):
+        if widget.winfo_manager() == 'pack':
+            hidden.append((widget, widget.pack_info()))
+            widget.pack_forget()
+    prior_collapsed = app.player_collapsed
+    app.set_player_collapsed(True)
     table.pack_forget()
     host = ttk.Frame(app.content)
     host.pack(side='left', fill='both', expand=True)
@@ -68,18 +77,21 @@ def open_genre_workspace(app):
         host.destroy()
         app._genre_workspace = None
         table.pack(side='left', fill='both', expand=True)
+        for widget, pack_options in hidden:
+            widget.pack(**pack_options)
+        app.set_player_collapsed(prior_collapsed)
 
     header = ttk.Frame(host, padding=(12, 10))
     header.pack(fill='x')
     ttk.Label(header, text='Genre Cleanup', font=('Helvetica', 20, 'bold')).pack(side='left')
     ttk.Button(header, text='Back to Library', command=close).pack(side='right')
-    toolbar = ttk.Frame(host, padding=(12, 4))
+    toolbar = ttk.Frame(host, padding=(8, 2))
     toolbar.pack(fill='x')
     ttk.Label(toolbar, text='Search').pack(side='left', padx=(0, 6))
     ttk.Entry(toolbar, textvariable=query, width=24).pack(side='left')
 
     viewport = tk.Frame(host, bg=dark)
-    viewport.pack(fill='both', expand=True, padx=10, pady=8)
+    viewport.pack(fill='both', expand=True, padx=6, pady=4)
     canvas = tk.Canvas(viewport, bg=dark, highlightthickness=0)
     hbar = ttk.Scrollbar(viewport, orient='horizontal', command=canvas.xview)
     vbar = ttk.Scrollbar(viewport, orient='vertical', command=canvas.yview)
@@ -90,6 +102,16 @@ def open_genre_workspace(app):
     inside = tk.Frame(canvas, bg=dark)
     window_id = canvas.create_window((0, 0), window=inside, anchor='nw')
     inside.bind('<Configure>', lambda _: canvas.configure(scrollregion=canvas.bbox('all')))
+
+    def size_columns(event=None):
+        # Four generously sized genre families per visible page; scroll for more.
+        width = max(250, (canvas.winfo_width() - 42) // 4)
+        height = max(320, canvas.winfo_height() - 22)
+        for child in inside.winfo_children():
+            child.configure(width=width, height=height)
+        canvas.configure(scrollregion=canvas.bbox('all'))
+
+    canvas.bind('<Configure>', size_columns)
 
     def families():
         names = list(DEFAULT_GROUPS) + [g for g in custom_groups if g not in DEFAULT_GROUPS]
@@ -138,7 +160,10 @@ def open_genre_workspace(app):
         grouped, genres = families()
         search = query.get().strip().casefold()
         for index, (group, names) in enumerate(grouped.items()):
-            column = tk.Frame(inside, bg=panel, width=245, padx=8, pady=8, highlightbackground='#383B42', highlightthickness=1)
+            column = tk.Frame(inside, bg=panel, width=max(250, (canvas.winfo_width() - 42) // 4),
+                              height=max(320, canvas.winfo_height() - 22), padx=8, pady=8,
+                              highlightbackground='#383B42', highlightthickness=1)
+            column.pack_propagate(False)
             column.grid(row=0, column=index, sticky='ns', padx=5, pady=5)
             shown = [name for name in names if not search or search in name.casefold() or search in group.casefold()]
             all_selected = bool(shown) and all((group, name) in chosen for name in shown)
@@ -169,6 +194,7 @@ def open_genre_workspace(app):
                 btn.pack(fill='x', pady=1)
             dark_action(column, '+ Add subgenre', lambda g=group: add_genre(g),
                         bg=panel, color=yellow).pack(fill='x', pady=(10, 0))
+        inside.update_idletasks()
         canvas.configure(scrollregion=canvas.bbox('all'))
         refresh_status()
 
@@ -222,7 +248,7 @@ def open_genre_workspace(app):
 
     ttk.Button(toolbar, text='+ Add Main Genre', command=add_group).pack(side='left', padx=(12, 4))
     ttk.Button(toolbar, text='Clear Selection', command=lambda: (chosen.clear(), redraw())).pack(side='left')
-    footer = ttk.Frame(host, padding=(12, 8))
+    footer = ttk.Frame(host, padding=(8, 4))
     footer.pack(fill='x')
     ttk.Label(footer, textvariable=status, style='Muted.TLabel').pack(side='left', fill='x', expand=True)
     ttk.Button(footer, text='History / Restore', command=app.genre_restore_history).pack(side='right', padx=5)
