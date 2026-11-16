@@ -88,6 +88,7 @@ def open_genre_workspace(app):
     organization = app.extra_settings.setdefault('genre_organization', {})
     custom_groups = app.extra_settings.setdefault('genre_custom_groups', [])
     custom_genres = app.extra_settings.setdefault('genre_custom_genres', [])
+    genre_order = app.extra_settings.setdefault('genre_main_order', [])
     # Seed the familiar families without changing any track metadata.
     # Repair old cross-family assignments only for canonical duplicates.
     for group, names in SUGGESTED.items():
@@ -109,6 +110,7 @@ def open_genre_workspace(app):
     selected_families = set()  # Empty families can be selected for organization
     family_widgets = {}
     chip_widgets = {}
+    reorder = {'source': None, 'start': None, 'moved': False, 'target': None}
     pending = tk.StringVar(value="")
     show_all = tk.BooleanVar(value=True)
     target_genre = tk.StringVar(value='')
@@ -210,7 +212,10 @@ def open_genre_workspace(app):
     bind_scroll(inside)
 
     def families():
-        names = [g for g in DEFAULT_GROUPS if g != 'Other'] + [g for g in custom_groups if g not in DEFAULT_GROUPS and g != 'Other'] + ['Other']
+        known = [g for g in DEFAULT_GROUPS if g != 'Other'] + [g for g in custom_groups if g not in DEFAULT_GROUPS and g != 'Other']
+        names = [g for g in genre_order if g in known and g != 'Other']
+        names += [g for g in known if g not in names]
+        names.append('Other')
         genres = inventory(app.rows, custom_genres)
         grouped = {g: [] for g in names}
         candidates = list(genres)
@@ -372,15 +377,12 @@ def open_genre_workspace(app):
                               highlightbackground='#383B42', highlightthickness=1)
             column.pack(fill='x', pady=(0, 16))
             bind_scroll(column)
-            all_selected = group in selected_families or (
-                bool(shown) and all((group, name) in chosen for name in shown))
+            all_selected = group in selected_families
             def choose_family(g=group, entries=tuple(shown)):
                 if g in selected_families:
                     selected_families.remove(g)
-                    chosen.difference_update((g, name) for name in entries)
                 else:
                     selected_families.add(g)
-                    chosen.update((g, name) for name in entries)
                 redraw()
             heading = dark_action(column, ('☑ ' if all_selected else '□ ') +
                                   f'{group}  ({family_track_count(group, grouped, genres)})',
@@ -388,6 +390,48 @@ def open_genre_workspace(app):
                                   color=yellow, bold=True, pad_y=9)
             heading._genre_click_target = True
             heading.pack(fill='x')
+            handle = tk.Label(heading, text='⠿', bg='#3E3823' if all_selected else '#30333A',
+                              fg=yellow, cursor='fleur', padx=7,
+                              font=('Helvetica', 15, 'bold'))
+            handle.pack(side='right')
+            handle._genre_click_target = True
+            def begin_reorder(event, g=group):
+                reorder.update(source=g, start=(event.x_root, event.y_root), moved=False, target=None)
+                return 'break'
+            def move_reorder(event):
+                if not reorder['source'] or not reorder['start']:
+                    return 'break'
+                x, y = reorder['start']
+                if abs(event.x_root-x) + abs(event.y_root-y) > 7:
+                    reorder['moved'] = True
+                if reorder['moved']:
+                    target = drag_target(event.x_root, event.y_root)
+                    if target == 'Other' or reorder['source'] == 'Other':
+                        target = None
+                    reorder['target'] = target
+                    for g, card in family_widgets.items():
+                        card.configure(highlightbackground=yellow if g == target else '#383B42',
+                                       highlightthickness=2 if g == target else 1)
+                return 'break'
+            def end_reorder(event):
+                source = reorder['source']
+                target = reorder['target'] if reorder['moved'] else None
+                reorder.update(source=None, start=None, moved=False, target=None)
+                if source and target and source != target:
+                    current = [g for g in families()[0] if g != 'Other']
+                    if source in current and target in current:
+                        current.remove(source)
+                        current.insert(current.index(target), source)
+                        genre_order[:] = current
+                        app.save_preferences()
+                        redraw()
+                        refresh_status(f'Moved {source} before {target} · display order saved')
+                else:
+                    redraw()
+                return 'break'
+            handle.bind('<ButtonPress-1>', begin_reorder)
+            handle.bind('<B1-Motion>', move_reorder)
+            handle.bind('<ButtonRelease-1>', end_reorder)
             family_widgets[group] = column
             # Compact chips wrap by their own text widths, rather than filling rows.
             chip_area = tk.Frame(column, bg=panel)
@@ -462,8 +506,8 @@ def open_genre_workspace(app):
         existing_subgenre = next((n for n in all_names if canonical_genre(n) == canonical_genre(name)), None)
         if existing_subgenre:
             if not messagebox.askyesno('Promote subgenre',
-                    f'"{existing_subgenre}" already exists as a subgenre.\\n\\n'
-                    'Promote it to a main genre? Existing track tags will not change.',
+                    f'"{existing_subgenre}" already exists as a subgenre.\n\n'
+                    'Promote it to a main genre?',
                     parent=host):
                 return
             name = existing_subgenre

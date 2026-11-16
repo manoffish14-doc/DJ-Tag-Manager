@@ -479,7 +479,7 @@ from waveform_player import WaveformController
 class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
     def __init__(self, root):
         self.root = root
-        root.title(APP_NAME + ' 3.1.4 Development')
+        root.title(APP_NAME + ' 3.1.5 Development')
         root.geometry('1300x780')
         root.minsize(1050, 650)
         apply_dark_theme(root)
