@@ -37,7 +37,7 @@ def inventory(rows, custom=()):
 
 def family_track_count(group, grouped, genres):
     """Count distinct track paths across all subgenres of a family."""
-    return len({path for name in grouped.get(group, ()) for path in genres.get(name, ())})
+    return len({path for name in (group, *grouped.get(group, ())) for path in genres.get(name, ())})
 
 
 def plan_genre_writes(rows, assignments):
@@ -108,6 +108,7 @@ def open_genre_workspace(app):
     chosen = set()  # (parent, subgenre); selection is independent of file writes
     selected_families = set()  # Empty families can be selected for organization
     family_widgets = {}
+    chip_widgets = {}
     pending = tk.StringVar(value="")
     show_all = tk.BooleanVar(value=True)
     target_genre = tk.StringVar(value='')
@@ -153,7 +154,7 @@ def open_genre_workspace(app):
     window_id = canvas.create_window((0, 0), window=inside, anchor='nw')
     inside.bind('<Configure>', lambda _: canvas.configure(scrollregion=canvas.bbox('all')))
 
-    COLUMN_WIDTH = 260
+    COLUMN_WIDTH = 270
     COLUMN_GAP = 12
     def size_columns(event=None):
         # Match the canvas viewport so the grid never scrolls sideways.
@@ -222,6 +223,8 @@ def open_genre_workspace(app):
             if key not in unique or (genres.get(name) and not genres.get(unique[key])):
                 unique[key] = name
         for name in unique.values():
+            if name in names:
+                continue  # Main genres must not appear as their own subgenres.
             group = organization.get(name)
             if group not in grouped:
                 group = genre_group(name)
@@ -333,6 +336,7 @@ def open_genre_workspace(app):
         for widget in inside.winfo_children():
             widget.destroy()
         family_widgets.clear()
+        chip_widgets.clear()
         grouped, genres = families()
         search = query.get().strip().casefold()
         visible = []
@@ -349,57 +353,81 @@ def open_genre_workspace(app):
         columns = max(1, min(3, available // (COLUMN_WIDTH + COLUMN_GAP)))
         # Use the full row width while keeping cards within a reasonable size.
         card_width = max(180, (available - 10 * columns) // columns)
-        for c in range(3):
-            inside.grid_columnconfigure(c, weight=1 if c < columns else 0, uniform='genre' if c < columns else '')
+        # Independent column stacks: a tall family never pushes down its neighbors.
+        for child in inside.winfo_children():
+            child.destroy()
+        stacks = []
+        for c in range(columns):
+            inside.grid_columnconfigure(c, weight=1, uniform='genre')
+            stack = tk.Frame(inside, bg=dark)
+            stack.grid(row=0, column=c, sticky='new', padx=5)
+            stacks.append(stack)
+        for c in range(columns, 3):
+            inside.grid_columnconfigure(c, weight=0, uniform='')
+        heights = [0] * columns
         for index, (group, shown) in enumerate(visible):
-            column = tk.Frame(inside, bg=panel, width=card_width, padx=8, pady=8,
+            # Balance the vertical stacks, while keeping Other last.
+            slot = min(range(columns), key=lambda c: (heights[c], c))
+            column = tk.Frame(stacks[slot], bg=panel, padx=8, pady=8,
                               highlightbackground='#383B42', highlightthickness=1)
-            column.grid_propagate(False)
-            column.grid(row=index // columns, column=index % columns,
-                        sticky='new', padx=5, pady=5)
+            column.pack(fill='x', pady=(0, 16))
             bind_scroll(column)
-            all_selected = (bool(shown) and all((group, name) in chosen for name in shown)) or (not shown and group in selected_families)
+            all_selected = group in selected_families or (
+                bool(shown) and all((group, name) in chosen for name in shown))
             def choose_family(g=group, entries=tuple(shown)):
-                if not entries:
-                    if g in selected_families:
-                        selected_families.remove(g)
-                    else:
-                        selected_families.add(g)
-                elif all((g, name) in chosen for name in entries):
+                if g in selected_families:
+                    selected_families.remove(g)
                     chosen.difference_update((g, name) for name in entries)
                 else:
+                    selected_families.add(g)
                     chosen.update((g, name) for name in entries)
                 redraw()
-            heading = dark_action(column, ('☑ ' if all_selected else '□ ') + f'{group}  ({family_track_count(group, grouped, genres)})',
+            heading = dark_action(column, ('☑ ' if all_selected else '□ ') +
+                                  f'{group}  ({family_track_count(group, grouped, genres)})',
                                   choose_family, bg='#3E3823' if all_selected else '#30333A',
                                   color=yellow, bold=True, pad_y=9)
             heading._genre_click_target = True
             heading.pack(fill='x')
             family_widgets[group] = column
+            # Compact chips wrap by their own text widths, rather than filling rows.
+            chip_area = tk.Frame(column, bg=panel)
+            chip_area.pack(fill='x', pady=(6, 0))
+            bind_scroll(chip_area)
+            chip_widgets[group] = []
             for name in shown:
                 is_selected = (group, name) in chosen
-                btn = dark_action(column,
-                                  ('☑ ' if is_selected else '□ ') + f'{name}  ({len(genres.get(name, []))})',
-                                  lambda: None, bg='#3E3823' if is_selected else panel,
-                                  color=fg, pad_y=6)
+                btn = dark_action(chip_area,
+                                  ('☑ ' if is_selected else '□ ') + f'{name} ({len(genres.get(name, []))})',
+                                  lambda: None, bg='#3E3823' if is_selected else '#30333A',
+                                  color=fg, pad_y=5)
                 btn.unbind('<Button-1>')
                 def start_drag(e, g=group, n=name):
                     drag_start(e, g, n)
-                    # Widget-local motion is reliable; root binding misses events
-                    # when the pointer crosses into another widget on macOS.
                     drag['root_<B1-Motion>'] = app.root.bind('<B1-Motion>', drag_motion, add='+')
                     drag['root_<ButtonRelease-1>'] = app.root.bind('<ButtonRelease-1>', finish_drag, add='+')
                 btn.bind('<ButtonPress-1>', start_drag)
                 btn.bind('<B1-Motion>', drag_motion)
                 btn.bind('<ButtonRelease-1>', finish_drag)
                 btn._genre_click_target = True
-                btn.pack(fill='x', pady=1)
-            dark_action(column, '+ Add subgenre', lambda g=group: add_genre(g),
-                        bg=panel, color=yellow).pack(fill='x', pady=(8, 0))
-            # Explicit height is required because fixed-width cards disable geometry propagation.
-            column.update_idletasks()
-            height = sum(w.winfo_reqheight() for w in column.winfo_children()) + 22
-            column.configure(height=height)
+                chip_widgets[group].append(btn)
+            def layout_chips(e=None, group=group, area=chip_area):
+                width = max(120, area.winfo_width() - 4)
+                x, y, line_height = 0, 0, 0
+                for chip in chip_widgets.get(group, []):
+                    w = min(width, chip.winfo_reqwidth())
+                    h = chip.winfo_reqheight()
+                    if x and x + w > width:
+                        x, y, line_height = 0, y + line_height + 5, 0
+                    chip.place(x=x, y=y, width=w, height=h)
+                    x += w + 5
+                    line_height = max(line_height, h)
+                area.configure(height=max(1, y + line_height))
+            chip_area.bind('<Configure>', layout_chips, add='+')
+            column.after_idle(layout_chips)
+            # Estimate height for balancing; actual Tk geometry follows chip wrapping.
+            estimated_chips = sum(max(65, 15 + len(n) * 7) for n in shown)
+            lines = max(1, (estimated_chips + max(1, card_width - 20) - 1) // max(1, card_width - 20))
+            heights[slot] += 64 + lines * 35 + 16
         inside.update_idletasks()
         canvas.configure(scrollregion=canvas.bbox('all'))
         canvas.yview_moveto(previous_y if inside.winfo_reqheight() > canvas.winfo_height() else 0)
@@ -427,10 +455,26 @@ def open_genre_workspace(app):
         name = name.strip()
         all_names = set(DEFAULT_GROUPS) | set(custom_groups) | set(organization) | set(inventory(app.rows, custom_genres))
         for names in SUGGESTED.values(): all_names.update(names)
-        if is_duplicate_genre(name, all_names):
-            messagebox.showwarning('Duplicate main genre', f'"{name}" already exists (or is a spelling variant).', parent=host)
+        main_names = set(DEFAULT_GROUPS) | set(custom_groups)
+        if is_duplicate_genre(name, main_names):
+            messagebox.showwarning('Duplicate main genre', f'"{name}" is already a main genre.', parent=host)
             return
+        existing_subgenre = next((n for n in all_names if canonical_genre(n) == canonical_genre(name)), None)
+        if existing_subgenre:
+            if not messagebox.askyesno('Promote subgenre',
+                    f'"{existing_subgenre}" already exists as a subgenre.\\n\\n'
+                    'Promote it to a main genre? Existing track tags will not change.',
+                    parent=host):
+                return
+            name = existing_subgenre
         custom_groups.append(name)
+        # Remove its old parent mapping; other subgenres stay where they are.
+        for alias in list(organization):
+            if canonical_genre(alias) == canonical_genre(name):
+                organization.pop(alias, None)
+        organization[name] = name
+        chosen.clear()
+        selected_families.clear()
         app.save_preferences()
         redraw()
 
@@ -476,7 +520,7 @@ def open_genre_workspace(app):
         # Genre controls and their containers manage their own clicks.
         node = widget
         while node is not None:
-            if getattr(node, '_genre_click_target', False) or node in family_widgets.values():
+            if getattr(node, '_genre_click_target', False) or node in family_widgets.values() or node in chip_widgets.values():
                 return
             node = getattr(node, 'master', None)
         # Keep inputs and buttons functional; a click on them still clears the selection.

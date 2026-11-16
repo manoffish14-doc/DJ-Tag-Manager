@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 import requests
 
 REPO = 'manoffish14-doc/DJ-Tag-Manager'
-VERSION = '3.1.3'
+VERSION = '3.1.4'
 ZIP_NAME = 'DJ-Tag-Manager-Mac.zip'
 CHECKSUM_NAME = ZIP_NAME + '.sha256'
 
