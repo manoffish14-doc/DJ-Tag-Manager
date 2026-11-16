@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 import requests
 
 REPO = 'manoffish14-doc/DJ-Tag-Manager'
-VERSION = '3.1.2'
+VERSION = '3.1.3'
 ZIP_NAME = 'DJ-Tag-Manager-Mac.zip'
 CHECKSUM_NAME = ZIP_NAME + '.sha256'
 
@@ -118,8 +118,10 @@ def show_update_dialog(root):
                     status.config(text='Latest release is a draft or prerelease; no update offered.')
                 elif tag == VERSION:
                     status.config(text=f'You are running the latest release ({VERSION}).')
-                elif not tag.startswith('3.') or tuple(int(x) for x in tag.split('.')) <= tuple(int(x) for x in VERSION.split('.')):
-                    status.config(text=f'Latest release {tag} is not a v3 update.')
+                elif not re.fullmatch(r'3\.\d+\.\d+', tag):
+                    status.config(text=f'Release {tag or "(unnamed)"} has an unsupported version format.')
+                elif tuple(int(x) for x in tag.split('.')) < tuple(int(x) for x in VERSION.split('.')):
+                    status.config(text=f'You are running {VERSION}; latest published release is older ({tag}). No update needed.')
                 else:
                     if ZIP_NAME not in assets or CHECKSUM_NAME not in assets:
                         status.config(text=f'Release {tag} is missing the Mac update ZIP or checksum.')

@@ -35,6 +35,11 @@ def inventory(rows, custom=()):
     return dict(found)
 
 
+def family_track_count(group, grouped, genres):
+    """Count distinct track paths across all subgenres of a family."""
+    return len({path for name in grouped.get(group, ()) for path in genres.get(name, ())})
+
+
 def plan_genre_writes(rows, assignments):
     """Pure plan: {subgenre: parent} -> {path: metadata}, preserving the original genre."""
     planned = {}
@@ -101,6 +106,7 @@ def open_genre_workspace(app):
     query = tk.StringVar()
     status = tk.StringVar(value='Select a genre family or individual subgenres, then Save Changes.')
     chosen = set()  # (parent, subgenre); selection is independent of file writes
+    selected_families = set()  # Empty families can be selected for organization
     family_widgets = {}
     pending = tk.StringVar(value="")
     show_all = tk.BooleanVar(value=True)
@@ -147,7 +153,7 @@ def open_genre_workspace(app):
     window_id = canvas.create_window((0, 0), window=inside, anchor='nw')
     inside.bind('<Configure>', lambda _: canvas.configure(scrollregion=canvas.bbox('all')))
 
-    COLUMN_WIDTH = 245
+    COLUMN_WIDTH = 260
     COLUMN_GAP = 12
     def size_columns(event=None):
         # Match the canvas viewport so the grid never scrolls sideways.
@@ -192,6 +198,9 @@ def open_genre_workspace(app):
             widget = getattr(widget, 'master', None)
     scroll_binding = app.root.bind_all('<MouseWheel>', global_scroll, add='+')
     def unbind_global_scroll():
+        if global_click_id:
+            try: app.root.unbind_class('all', '<Button-1>', global_click_id)
+            except Exception: pass
         if scroll_binding:
             try: app.root.unbind_all('<MouseWheel>')
             except Exception: pass
@@ -224,13 +233,13 @@ def open_genre_workspace(app):
         return grouped, genres
 
     def selected_count():
-        return len(chosen)
+        return len(chosen) + len(selected_families)
 
     def refresh_status(note=None):
         if note:
             status.set(note)
         else:
-            status.set(f'{selected_count()} subgenres selected · Save writes Genre = family / Composer = original')
+            status.set(f'{len(chosen)} subgenres · {len(selected_families)} empty families selected · Genre = family / Composer = original')
         pending.set("● Unsaved tag changes" if chosen else "No pending tag changes")
 
     def dark_action(parent, title, callback, *, bg=panel, color=fg, bold=False, pad_y=7):
@@ -337,10 +346,10 @@ def open_genre_workspace(app):
             # A family is nonempty if any of its genres has songs in this library.
             visible.append((group, shown))
         available = max(1, canvas.winfo_width() - 12)
-        columns = max(1, min(4, available // (COLUMN_WIDTH + COLUMN_GAP)))
+        columns = max(1, min(3, available // (COLUMN_WIDTH + COLUMN_GAP)))
         # Use the full row width while keeping cards within a reasonable size.
-        card_width = max(220, (available - 10 * columns) // columns)
-        for c in range(4):
+        card_width = max(180, (available - 10 * columns) // columns)
+        for c in range(3):
             inside.grid_columnconfigure(c, weight=1 if c < columns else 0, uniform='genre' if c < columns else '')
         for index, (group, shown) in enumerate(visible):
             column = tk.Frame(inside, bg=panel, width=card_width, padx=8, pady=8,
@@ -349,16 +358,22 @@ def open_genre_workspace(app):
             column.grid(row=index // columns, column=index % columns,
                         sticky='new', padx=5, pady=5)
             bind_scroll(column)
-            all_selected = bool(shown) and all((group, name) in chosen for name in shown)
+            all_selected = (bool(shown) and all((group, name) in chosen for name in shown)) or (not shown and group in selected_families)
             def choose_family(g=group, entries=tuple(shown)):
-                if all((g, name) in chosen for name in entries):
+                if not entries:
+                    if g in selected_families:
+                        selected_families.remove(g)
+                    else:
+                        selected_families.add(g)
+                elif all((g, name) in chosen for name in entries):
                     chosen.difference_update((g, name) for name in entries)
                 else:
                     chosen.update((g, name) for name in entries)
                 redraw()
-            heading = dark_action(column, ('☑ ' if all_selected else '□ ') + group,
+            heading = dark_action(column, ('☑ ' if all_selected else '□ ') + f'{group}  ({family_track_count(group, grouped, genres)})',
                                   choose_family, bg='#3E3823' if all_selected else '#30333A',
                                   color=yellow, bold=True, pad_y=9)
+            heading._genre_click_target = True
             heading.pack(fill='x')
             family_widgets[group] = column
             for name in shown:
@@ -377,6 +392,7 @@ def open_genre_workspace(app):
                 btn.bind('<ButtonPress-1>', start_drag)
                 btn.bind('<B1-Motion>', drag_motion)
                 btn.bind('<ButtonRelease-1>', finish_drag)
+                btn._genre_click_target = True
                 btn.pack(fill='x', pady=1)
             dark_action(column, '+ Add subgenre', lambda g=group: add_genre(g),
                         bg=panel, color=yellow).pack(fill='x', pady=(8, 0))
@@ -443,6 +459,7 @@ def open_genre_workspace(app):
             app.store.history('genre_cleanup_written', {'files': journal})
         app.persist_library()
         chosen.clear()
+        selected_families.clear()
         redraw()
         refresh_status(f'Saved {len(journal)} files · {len(errors)} errors' + (f' · {errors[0]}' if errors else ''))
 
@@ -450,9 +467,23 @@ def open_genre_workspace(app):
     ttk.Checkbutton(toolbar, text='Show All Genres', variable=show_all, command=redraw).pack(side='left', padx=(12, 4))
     # Clicking the blank canvas deselects everything, without a separate button.
     def clear_on_background(event):
-        if drag['source'] is None and chosen:
+        if drag['source'] is None and (chosen or selected_families):
             chosen.clear()
+            selected_families.clear()
             redraw()
+    def global_clear(event):
+        widget = event.widget
+        # Genre controls and their containers manage their own clicks.
+        node = widget
+        while node is not None:
+            if getattr(node, '_genre_click_target', False) or node in family_widgets.values():
+                return
+            node = getattr(node, 'master', None)
+        # Keep inputs and buttons functional; a click on them still clears the selection.
+        if widget is not app.root and (chosen or selected_families):
+            clear_on_background(event)
+
+    global_click_id = app.root.bind_all('<Button-1>', global_clear, add='+')
     canvas.bind('<Button-1>', clear_on_background, add='+')
     inside.bind('<Button-1>', clear_on_background, add='+')
     header.bind('<Button-1>', clear_on_background, add='+')
@@ -461,12 +492,14 @@ def open_genre_workspace(app):
     footer = ttk.Frame(host, padding=(8, 4))
     footer.pack(fill='x')
     footer.bind('<Button-1>', clear_on_background, add='+')
-    ttk.Label(footer, textvariable=status, style='Muted.TLabel').pack(side='left', fill='x', expand=True)
+    ttk.Label(footer, textvariable=status, style='Muted.TLabel').pack(fill='x', pady=(0, 4))
     ttk.Label(toolbar, textvariable=pending, style='Muted.TLabel').pack(side='right', padx=8)
-    ttk.Button(footer, text='History / Restore', command=app.genre_restore_history).pack(side='right', padx=5)
-    ttk.Button(footer, text='Save Changes', command=write_changes, style='Accent.TButton').pack(side='right', padx=5)
-    ttk.Entry(footer, textvariable=target_genre, width=19).pack(side='right', padx=(4, 5))
-    ttk.Label(footer, text='New Genre (optional):').pack(side='right', padx=4)
+    actions = ttk.Frame(footer)
+    actions.pack(fill='x')
+    ttk.Label(actions, text='New Genre (optional):').pack(side='left', padx=(0, 5))
+    ttk.Entry(actions, textvariable=target_genre, width=19).pack(side='left', fill='x', expand=True, padx=(0, 8))
+    ttk.Button(actions, text='Save Changes', command=write_changes, style='Accent.TButton').pack(side='left', padx=(0, 5))
+    ttk.Button(actions, text='History / Restore', command=app.genre_restore_history).pack(side='left')
     # A compact, independent control in each bottom corner; both default collapsed.
     task_toggle = tk.Label(host, text='▸ Tasks', bg='#30353E', fg=yellow, cursor='hand2', padx=10, pady=5)
     task_toggle.pack(side='bottom', anchor='w')
