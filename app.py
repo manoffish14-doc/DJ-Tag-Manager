@@ -479,7 +479,7 @@ from waveform_player import WaveformController
 class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
     def __init__(self, root):
         self.root = root
-        root.title(APP_NAME + ' 3.1.0 Combined Development')
+        root.title(APP_NAME + ' 3.1.1 Development')
         root.geometry('1300x780')
         root.minsize(1050, 650)
         apply_dark_theme(root)
@@ -546,7 +546,7 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
         self.settings_menu = tk.Menu(root, tearoff=False, bg=COLORS['panel'],
                                      fg=COLORS['text'], activebackground=COLORS['select'],
                                      activeforeground=COLORS['accent'], borderwidth=0)
-        self.settings_menu.add_command(label='Check for Updates…', command=lambda: messagebox.showinfo(APP_NAME, 'Updater disabled in this isolated development preview.'))
+        self.settings_menu.add_command(label='Check for Updates…', command=lambda: show_update_dialog(self.root))
         self.settings_menu.add_separator()
         self.settings_menu.add_command(label='API Settings…', command=self.settings)
         self.settings_menu.add_command(label='Import & Automation…', command=self.import_automation_settings)
@@ -752,6 +752,10 @@ class App(MacFeedbackFixes, IntegratedWorkflows, AdvancedTools):
         return True
 
     def choose_view(self, name):
+        workspace = getattr(self, '_genre_workspace', None)
+        if workspace is not None and workspace.winfo_exists():
+            closer = getattr(self, '_close_genre_workspace', None)
+            if closer: closer()
         self.current_view = name
         for n, button in self.sidebar_buttons.items():
             button.configure(fg=COLORS['accent'] if n == name else '#F5F5F5')

@@ -15,8 +15,8 @@ from urllib.parse import urlparse
 import requests
 
 REPO = 'manoffish14-doc/DJ-Tag-Manager'
-VERSION = '3.0.5'
-ZIP_NAME = 'DJ-Tag-Manager-Mac.zip'
+VERSION = '3.1.1'
+ZIP_NAME = 'DJ-Tag-Manager-v3-Mac.zip'
 CHECKSUM_NAME = ZIP_NAME + '.sha256'
 
 
@@ -50,10 +50,10 @@ def _running_app():
     if not candidates:
         raise RuntimeError('Updater only works when running from the packaged Mac application.')
     app = candidates[0]
-    if app.name != 'DJ Tag Manager.app':
+    if app.name != 'DJ Tag Manager v3.app':
         raise RuntimeError('Unexpected application name; refusing to replace another app.')
     info = plistlib.loads((app / 'Contents' / 'Info.plist').read_bytes())
-    if info.get('CFBundleIdentifier') != 'com.djtagmanager.app':
+    if info.get('CFBundleIdentifier') != 'com.djtagmanager.v3development':
         raise RuntimeError('Unexpected application identity; update cancelled.')
     return app
 
@@ -79,15 +79,15 @@ def _install_worker(release, assets, root, status, button):
         extracted = base / 'extracted'
         extracted.mkdir()
         subprocess.run(['/usr/bin/ditto', '-x', '-k', str(archive), str(extracted)], check=True)
-        incoming = extracted / 'DJ Tag Manager.app'
+        incoming = extracted / 'DJ Tag Manager v3.app'
         info = plistlib.loads((incoming / 'Contents' / 'Info.plist').read_bytes())
-        if info.get('CFBundleIdentifier') != 'com.djtagmanager.app':
+        if info.get('CFBundleIdentifier') != 'com.djtagmanager.v3development':
             raise ValueError('Downloaded app has an unexpected bundle identifier.')
         helper = Path(getattr(sys, '_MEIPASS', Path(__file__).parent)) / 'update_helper.sh'
         if not helper.exists():
             raise FileNotFoundError('Bundled update_helper.sh is missing.')
-        backup = destination.with_name('DJ Tag Manager.previous.app')
-        pending = destination.with_name('DJ Tag Manager.incoming.app')
+        backup = destination.with_name('DJ Tag Manager v3.previous.app')
+        pending = destination.with_name('DJ Tag Manager v3.incoming.app')
         if backup.exists() or pending.exists():
             raise RuntimeError('A previous backup or pending update exists next to the app. Resolve it before updating.')
         log = base / 'install.log'

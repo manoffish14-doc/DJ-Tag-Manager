@@ -84,9 +84,20 @@ def open_genre_workspace(app):
     custom_groups = app.extra_settings.setdefault('genre_custom_groups', [])
     custom_genres = app.extra_settings.setdefault('genre_custom_genres', [])
     # Seed the familiar families without changing any track metadata.
+    # Repair old cross-family assignments only for canonical duplicates.
     for group, names in SUGGESTED.items():
         for name in names:
             organization.setdefault(name, group)
+    for group in DEFAULT_GROUPS:
+        organization[group] = group
+    # A genre name belongs to exactly one family, including spelling variants.
+    seen = {}
+    for name in list(organization):
+        key = canonical_genre(name)
+        if key in seen and name != seen[key]:
+            del organization[name]
+        else:
+            seen[key] = name
     query = tk.StringVar()
     status = tk.StringVar(value='Select a genre family or individual subgenres, then Save Changes.')
     chosen = set()  # (parent, subgenre); selection is independent of file writes
@@ -95,10 +106,12 @@ def open_genre_workspace(app):
     show_all = tk.BooleanVar(value=True)
     target_genre = tk.StringVar(value='')
     wheel_remainder = [0.0]
+    refresh_job = [None]
     drag = {"source": None, "start": None, "moved": False, "target": None}
     dark, panel, fg, yellow = '#15171B', '#22252B', '#F2F3F5', '#FACC15'
 
     def close():
+        unbind_global_scroll()
         host.destroy()
         app._genre_workspace = None
         table.pack(side='left', fill='both', expand=True)
@@ -114,6 +127,7 @@ def open_genre_workspace(app):
         for widget, options in task_related:
             widget.pack(**options)
 
+    app._close_genre_workspace = close
     header = ttk.Frame(host, padding=(12, 10))
     header.pack(fill='x')
     ttk.Label(header, text='Genre Cleanup', font=('Helvetica', 20, 'bold')).pack(side='left')
@@ -135,64 +149,79 @@ def open_genre_workspace(app):
     inside.bind('<Configure>', lambda _: canvas.configure(scrollregion=canvas.bbox('all')))
 
     COLUMN_WIDTH = 265
-    COLUMN_GAP = 10
+    COLUMN_GAP = 12
     def size_columns(event=None):
         # Match the canvas viewport so the grid never scrolls sideways.
         canvas.itemconfigure(window_id, width=canvas.winfo_width())
         canvas.configure(scrollregion=canvas.bbox('all'))
         if event is not None and not drag['source']:
-            redraw()
+            if refresh_job[0] is not None:
+                host.after_cancel(refresh_job[0])
+            refresh_job[0] = host.after(100, redraw)
 
     canvas.bind('<Configure>', size_columns)
 
     def scroll_page(event):
-        # Tk on macOS emits small and sometimes fractional trackpad deltas.
-        # Accumulate them rather than treating every event as a full page jump.
+        # Aqua sends small pixel deltas (often 1-10), unlike Windows 120-unit ticks.
+        # Move in pixels to preserve precise trackpad motion and clamp to content.
         delta = float(getattr(event, 'delta', 0) or 0)
         if not delta:
             return 'break'
-        if abs(delta) >= 120:
-            steps = -delta / 120.0
-        else:
-            steps = -delta / 12.0
-        wheel_remainder[0] += steps
-        whole = int(wheel_remainder[0])
-        if whole:
-            canvas.yview_scroll(whole, 'units')
-            wheel_remainder[0] -= whole
+        content_height = max(1, inside.winfo_reqheight())
+        visible_height = canvas.winfo_height()
+        max_offset = max(0, content_height - visible_height)
+        if not max_offset:
+            return 'break'
+        current = canvas.yview()[0] * content_height
+        pixels = (-delta * (0.7 if abs(delta) < 120 else 0.28))
+        canvas.yview_moveto(max(0, min(max_offset, current + pixels)) / content_height)
         return 'break'
 
-    def scroll_horizontal(event):
-        # One wrapped grid; horizontal gestures must not shift genre columns.
-        return scroll_page(event)
-
     def bind_scroll(widget):
-        widget.bind('<MouseWheel>', scroll_page)
-        widget.bind('<Shift-MouseWheel>', scroll_horizontal)
-        widget.bind('<Button-4>', lambda e: (canvas.yview_scroll(-1, 'units'), 'break')[1])
-        widget.bind('<Button-5>', lambda e: (canvas.yview_scroll(1, 'units'), 'break')[1])
+        widget.bind('<MouseWheel>', scroll_page, add='+')
+        widget.bind('<Shift-MouseWheel>', scroll_page, add='+')
+        widget.bind('<Button-4>', lambda e: (canvas.yview_scroll(-2, 'units'), 'break')[1], add='+')
+        widget.bind('<Button-5>', lambda e: (canvas.yview_scroll(2, 'units'), 'break')[1], add='+')
+
+    # Global scrolling is only active while the pointer is over Genre Cleanup.
+    # This catches macOS events sent to nested ttk/tk widgets.
+    def global_scroll(event):
+        widget = app.root.winfo_containing(event.x_root, event.y_root)
+        while widget is not None:
+            if widget is viewport or widget is canvas or widget is inside:
+                return scroll_page(event)
+            widget = getattr(widget, 'master', None)
+    scroll_binding = app.root.bind_all('<MouseWheel>', global_scroll, add='+')
+    def unbind_global_scroll():
+        if scroll_binding:
+            try: app.root.unbind_all('<MouseWheel>')
+            except Exception: pass
 
     bind_scroll(canvas)
     bind_scroll(inside)
 
     def families():
-        names = [g for g in DEFAULT_GROUPS if g != 'Other'] + [g for g in custom_groups if g not in DEFAULT_GROUPS] + ['Other']
+        names = [g for g in DEFAULT_GROUPS if g != 'Other'] + [g for g in custom_groups if g not in DEFAULT_GROUPS and g != 'Other'] + ['Other']
         genres = inventory(app.rows, custom_genres)
         grouped = {g: [] for g in names}
-        for genre in genres:
-            group = organization.get(genre, genre_group(genre))
+        candidates = list(genres)
+        for suggestions in SUGGESTED.values():
+            candidates.extend(suggestions)
+        unique = {}
+        for name in candidates:
+            key = canonical_genre(name)
+            # Prefer actual library spelling when multiple aliases exist.
+            if key not in unique or (genres.get(name) and not genres.get(unique[key])):
+                unique[key] = name
+        for name in unique.values():
+            group = organization.get(name)
+            if group not in grouped:
+                group = genre_group(name)
             if group not in grouped:
                 group = 'Other'
-            grouped[group].append(genre)
-        # Suggested subgenres are visible even if no tracks currently use them.
-        for group, suggestions in SUGGESTED.items():
-            for name in suggestions:
-                if name not in grouped[group]:
-                    grouped[group].append(name)
+            grouped[group].append(name)
         for group in grouped:
-            if group not in grouped[group]:
-                grouped[group].insert(0, group)
-            grouped[group] = sorted(set(grouped[group]), key=lambda x: (x != group, x.casefold()))
+            grouped[group] = sorted(grouped[group], key=lambda x: (canonical_genre(x) != canonical_genre(group), x.casefold()))
         return grouped, genres
 
     def selected_count():
@@ -262,6 +291,10 @@ def open_genre_workspace(app):
         if moved:
             if target and target != group:
                 # Organization is preference-only; no music file is written here.
+                # Never duplicate the same subgenre in multiple families.
+                for alias in list(organization):
+                    if canonical_genre(alias) == canonical_genre(name):
+                        organization.pop(alias, None)
                 organization[name] = target
                 chosen.discard((group, name))
                 app.save_preferences()
@@ -296,21 +329,24 @@ def open_genre_workspace(app):
         search = query.get().strip().casefold()
         visible = []
         for group, names in grouped.items():
-            shown = [name for name in names if not search or search in name.casefold() or search in group.casefold()]
+            eligible = names if show_all.get() else [name for name in names if genres.get(name)]
+            shown = [name for name in eligible if not search or search in name.casefold() or search in group.casefold()]
             if not shown:
                 continue
             # A family is nonempty if any of its genres has songs in this library.
-            if not show_all.get() and not any(genres.get(n) for n in names):
-                continue
             visible.append((group, shown))
         available = max(1, canvas.winfo_width() - 12)
         columns = max(1, min(4, available // (COLUMN_WIDTH + COLUMN_GAP)))
+        # Use the full row width while keeping cards within a reasonable size.
+        card_width = max(220, min(390, (available - 10 * columns) // columns))
+        for c in range(columns):
+            inside.grid_columnconfigure(c, weight=1, uniform='genre')
         for index, (group, shown) in enumerate(visible):
-            column = tk.Frame(inside, bg=panel, width=COLUMN_WIDTH, padx=8, pady=8,
+            column = tk.Frame(inside, bg=panel, width=card_width, padx=8, pady=8,
                               highlightbackground='#383B42', highlightthickness=1)
             column.grid_propagate(False)
             column.grid(row=index // columns, column=index % columns,
-                        sticky='nw', padx=5, pady=5)
+                        sticky='new', padx=5, pady=5)
             bind_scroll(column)
             all_selected = bool(shown) and all((group, name) in chosen for name in shown)
             def choose_family(g=group, entries=tuple(shown)):
@@ -333,10 +369,13 @@ def open_genre_workspace(app):
                 btn.unbind('<Button-1>')
                 def start_drag(e, g=group, n=name):
                     drag_start(e, g, n)
+                    # Widget-local motion is reliable; root binding misses events
+                    # when the pointer crosses into another widget on macOS.
                     drag['root_<B1-Motion>'] = app.root.bind('<B1-Motion>', drag_motion, add='+')
                     drag['root_<ButtonRelease-1>'] = app.root.bind('<ButtonRelease-1>', finish_drag, add='+')
                 btn.bind('<ButtonPress-1>', start_drag)
                 btn.bind('<B1-Motion>', drag_motion)
+                btn.bind('<ButtonRelease-1>', finish_drag)
                 btn.pack(fill='x', pady=1)
             dark_action(column, '+ Add subgenre', lambda g=group: add_genre(g),
                         bg=panel, color=yellow).pack(fill='x', pady=(8, 0))
@@ -346,7 +385,7 @@ def open_genre_workspace(app):
             column.configure(height=height)
         inside.update_idletasks()
         canvas.configure(scrollregion=canvas.bbox('all'))
-        canvas.yview_moveto(previous_y)
+        canvas.yview_moveto(previous_y if inside.winfo_reqheight() > canvas.winfo_height() else 0)
         refresh_status()
 
     def add_genre(group):
@@ -414,6 +453,7 @@ def open_genre_workspace(app):
             chosen.clear()
             redraw()
     canvas.bind('<Button-1>', clear_on_background, add='+')
+    inside.bind('<Button-1>', clear_on_background, add='+')
     footer = ttk.Frame(host, padding=(8, 4))
     footer.pack(fill='x')
     ttk.Label(footer, textvariable=status, style='Muted.TLabel').pack(side='left', fill='x', expand=True)
