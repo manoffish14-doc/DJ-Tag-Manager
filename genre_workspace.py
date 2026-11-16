@@ -68,6 +68,11 @@ def open_genre_workspace(app):
     prior_feedback_visible = getattr(app, "_feedback_bar", None) is not None and bool(app._feedback_bar.winfo_manager())
     if prior_feedback_visible:
         app._feedback_bar.pack_forget()
+    task_related = []
+    for candidate in (getattr(app, '_queue_bar', None), getattr(app, 'queue_bar', None)):
+        if candidate is not None and candidate.winfo_manager() == 'pack':
+            task_related.append((candidate, candidate.pack_info()))
+            candidate.pack_forget()
     prior_status_visible = bool(app.status.winfo_manager())
     if prior_status_visible:
         app.status.pack_forget()
@@ -87,6 +92,9 @@ def open_genre_workspace(app):
     chosen = set()  # (parent, subgenre); selection is independent of file writes
     family_widgets = {}
     pending = tk.StringVar(value="")
+    show_all = tk.BooleanVar(value=True)
+    target_genre = tk.StringVar(value='')
+    wheel_remainder = [0.0]
     drag = {"source": None, "start": None, "moved": False, "target": None}
     dark, panel, fg, yellow = '#15171B', '#22252B', '#F2F3F5', '#FACC15'
 
@@ -103,6 +111,8 @@ def open_genre_workspace(app):
             app._feedback_bar.pack(fill="x", before=app.player_panel)
         if prior_status_visible:
             app.status.pack(fill="x", before=app.player_panel)
+        for widget, options in task_related:
+            widget.pack(**options)
 
     header = ttk.Frame(host, padding=(12, 10))
     header.pack(fill='x')
@@ -116,35 +126,45 @@ def open_genre_workspace(app):
     viewport = tk.Frame(host, bg=dark)
     viewport.pack(fill='both', expand=True, padx=6, pady=4)
     canvas = tk.Canvas(viewport, bg=dark, highlightthickness=0)
-    hbar = ttk.Scrollbar(viewport, orient='horizontal', command=canvas.xview)
     vbar = ttk.Scrollbar(viewport, orient='vertical', command=canvas.yview)
-    canvas.configure(xscrollcommand=hbar.set, yscrollcommand=vbar.set)
-    hbar.pack(side='bottom', fill='x')
+    canvas.configure(yscrollcommand=vbar.set)
     vbar.pack(side='right', fill='y')
     canvas.pack(side='left', fill='both', expand=True)
     inside = tk.Frame(canvas, bg=dark)
     window_id = canvas.create_window((0, 0), window=inside, anchor='nw')
     inside.bind('<Configure>', lambda _: canvas.configure(scrollregion=canvas.bbox('all')))
 
-    COLUMN_WIDTH = 290
+    COLUMN_WIDTH = 265
+    COLUMN_GAP = 10
     def size_columns(event=None):
-        # Fixed width, content-driven height. Never stretch columns on resize.
-        canvas.configure(scrollregion=canvas.bbox("all"))
+        # Match the canvas viewport so the grid never scrolls sideways.
+        canvas.itemconfigure(window_id, width=canvas.winfo_width())
+        canvas.configure(scrollregion=canvas.bbox('all'))
+        if event is not None and not drag['source']:
+            redraw()
 
     canvas.bind('<Configure>', size_columns)
 
     def scroll_page(event):
-        # macOS trackpads send MouseWheel events to the widget under the cursor.
-        # Scroll the single shared canvas, not an individual genre card.
-        if getattr(event, 'state', 0) & 0x0001:
-            canvas.xview_scroll(-1 if event.delta > 0 else 1, 'units')
+        # Tk on macOS emits small and sometimes fractional trackpad deltas.
+        # Accumulate them rather than treating every event as a full page jump.
+        delta = float(getattr(event, 'delta', 0) or 0)
+        if not delta:
+            return 'break'
+        if abs(delta) >= 120:
+            steps = -delta / 120.0
         else:
-            canvas.yview_scroll(-1 if event.delta > 0 else 1, 'units')
+            steps = -delta / 12.0
+        wheel_remainder[0] += steps
+        whole = int(wheel_remainder[0])
+        if whole:
+            canvas.yview_scroll(whole, 'units')
+            wheel_remainder[0] -= whole
         return 'break'
 
     def scroll_horizontal(event):
-        canvas.xview_scroll(-1 if event.delta > 0 else 1, 'units')
-        return 'break'
+        # One wrapped grid; horizontal gestures must not shift genre columns.
+        return scroll_page(event)
 
     def bind_scroll(widget):
         widget.bind('<MouseWheel>', scroll_page)
@@ -156,7 +176,7 @@ def open_genre_workspace(app):
     bind_scroll(inside)
 
     def families():
-        names = list(DEFAULT_GROUPS) + [g for g in custom_groups if g not in DEFAULT_GROUPS]
+        names = [g for g in DEFAULT_GROUPS if g != 'Other'] + [g for g in custom_groups if g not in DEFAULT_GROUPS] + ['Other']
         genres = inventory(app.rows, custom_genres)
         grouped = {g: [] for g in names}
         for genre in genres:
@@ -216,14 +236,8 @@ def open_genre_workspace(app):
         if abs(event.x_root - x) + abs(event.y_root - y) < 9 and not drag['moved']:
             return
         drag['moved'] = True
-        # Edge scrolling permits cross-column drops without grabbing a scrollbar.
+        # Edge scrolling is vertical only; columns wrap instead of scrolling sideways.
         edge = 38
-        left = canvas.winfo_rootx()
-        right = left + canvas.winfo_width()
-        if event.x_root > right - edge:
-            canvas.xview_scroll(2, 'units')
-        elif event.x_root < left + edge:
-            canvas.xview_scroll(-2, 'units')
         top = canvas.winfo_rooty()
         bottom = top + canvas.winfo_height()
         if event.y_root > bottom - edge:
@@ -266,27 +280,38 @@ def open_genre_workspace(app):
     def finish_drag(event):
         if drag['source']:
             drag_end(event)
-        # Keep only a single active root-level drag binding per gesture.
+        # Remove only our handlers; never remove other app-level bindings.
         for key in ('<B1-Motion>', '<ButtonRelease-1>'):
-            binding = drag.get('root_' + key)
+            binding = drag.pop('root_' + key, None)
             if binding:
-                try: app.root.unbind_all(key)
+                try: app.root.unbind(key, binding)
                 except Exception: pass
-                drag['root_' + key] = None
 
     def redraw(*_):
+        previous_y = canvas.yview()[0] if canvas.winfo_exists() else 0.0
         for widget in inside.winfo_children():
             widget.destroy()
         family_widgets.clear()
         grouped, genres = families()
         search = query.get().strip().casefold()
-        for index, (group, names) in enumerate(grouped.items()):
+        visible = []
+        for group, names in grouped.items():
+            shown = [name for name in names if not search or search in name.casefold() or search in group.casefold()]
+            if not shown:
+                continue
+            # A family is nonempty if any of its genres has songs in this library.
+            if not show_all.get() and not any(genres.get(n) for n in names):
+                continue
+            visible.append((group, shown))
+        available = max(1, canvas.winfo_width() - 12)
+        columns = max(1, min(4, available // (COLUMN_WIDTH + COLUMN_GAP)))
+        for index, (group, shown) in enumerate(visible):
             column = tk.Frame(inside, bg=panel, width=COLUMN_WIDTH, padx=8, pady=8,
                               highlightbackground='#383B42', highlightthickness=1)
-            column.grid_propagate(True)
-            column.grid(row=0, column=index, sticky='n', padx=5, pady=5)
+            column.grid_propagate(False)
+            column.grid(row=index // columns, column=index % columns,
+                        sticky='nw', padx=5, pady=5)
             bind_scroll(column)
-            shown = [name for name in names if not search or search in name.casefold() or search in group.casefold()]
             all_selected = bool(shown) and all((group, name) in chosen for name in shown)
             def choose_family(g=group, entries=tuple(shown)):
                 if all((g, name) in chosen for name in entries):
@@ -296,7 +321,7 @@ def open_genre_workspace(app):
                 redraw()
             heading = dark_action(column, ('☑ ' if all_selected else '□ ') + group,
                                   choose_family, bg='#3E3823' if all_selected else '#30333A',
-                                  color=yellow, bold=True, pad_y=10)
+                                  color=yellow, bold=True, pad_y=9)
             heading.pack(fill='x')
             family_widgets[group] = column
             for name in shown:
@@ -305,23 +330,23 @@ def open_genre_workspace(app):
                                   ('☑ ' if is_selected else '□ ') + f'{name}  ({len(genres.get(name, []))})',
                                   lambda: None, bg='#3E3823' if is_selected else panel,
                                   color=fg, pad_y=6)
-                # A release without motion selects; a drag moves the subgenre.
-                # Avoid redrawing during ButtonPress because it destroys the widget.
                 btn.unbind('<Button-1>')
-                # Bind on the root while dragging: Tk labels stop receiving motion
-                # and release once the pointer crosses into another column.
                 def start_drag(e, g=group, n=name):
                     drag_start(e, g, n)
-                    drag['root_<B1-Motion>'] = app.root.bind_all('<B1-Motion>', drag_motion, add='+')
-                    drag['root_<ButtonRelease-1>'] = app.root.bind_all('<ButtonRelease-1>', finish_drag, add='+')
+                    drag['root_<B1-Motion>'] = app.root.bind('<B1-Motion>', drag_motion, add='+')
+                    drag['root_<ButtonRelease-1>'] = app.root.bind('<ButtonRelease-1>', finish_drag, add='+')
                 btn.bind('<ButtonPress-1>', start_drag)
                 btn.bind('<B1-Motion>', drag_motion)
-                btn.bind('<ButtonRelease-1>', finish_drag)
                 btn.pack(fill='x', pady=1)
             dark_action(column, '+ Add subgenre', lambda g=group: add_genre(g),
-                        bg=panel, color=yellow).pack(fill='x', pady=(10, 0))
+                        bg=panel, color=yellow).pack(fill='x', pady=(8, 0))
+            # Explicit height is required because fixed-width cards disable geometry propagation.
+            column.update_idletasks()
+            height = sum(w.winfo_reqheight() for w in column.winfo_children()) + 22
+            column.configure(height=height)
         inside.update_idletasks()
         canvas.configure(scrollregion=canvas.bbox('all'))
+        canvas.yview_moveto(previous_y)
         refresh_status()
 
     def add_genre(group):
@@ -344,7 +369,9 @@ def open_genre_workspace(app):
         if not name or not name.strip():
             return
         name = name.strip()
-        if is_duplicate_genre(name, set(DEFAULT_GROUPS) | set(custom_groups) | set(organization)):
+        all_names = set(DEFAULT_GROUPS) | set(custom_groups) | set(organization) | set(inventory(app.rows, custom_genres))
+        for names in SUGGESTED.values(): all_names.update(names)
+        if is_duplicate_genre(name, all_names):
             messagebox.showwarning('Duplicate main genre', f'"{name}" already exists (or is a spelling variant).', parent=host)
             return
         custom_groups.append(name)
@@ -353,7 +380,8 @@ def open_genre_workspace(app):
 
     def write_changes():
         # No preview or confirmation by design. The only mutation trigger is Save.
-        assignments = {name: group for group, name in chosen}
+        override = target_genre.get().strip()
+        assignments = {name: (override or group) for group, name in chosen}
         changes_by_path = plan_genre_writes(app.rows, assignments)
         if not changes_by_path:
             refresh_status('No tracks require changes for the selected subgenres.')
@@ -379,13 +407,21 @@ def open_genre_workspace(app):
         refresh_status(f'Saved {len(journal)} files · {len(errors)} errors' + (f' · {errors[0]}' if errors else ''))
 
     ttk.Button(toolbar, text='+ Add Main Genre', command=add_group).pack(side='left', padx=(12, 4))
-    ttk.Button(toolbar, text='Clear Selection', command=lambda: (chosen.clear(), redraw())).pack(side='left')
+    ttk.Checkbutton(toolbar, text='Show All Genres', variable=show_all, command=redraw).pack(side='left', padx=(12, 4))
+    # Clicking the blank canvas deselects everything, without a separate button.
+    def clear_on_background(event):
+        if drag['source'] is None and chosen:
+            chosen.clear()
+            redraw()
+    canvas.bind('<Button-1>', clear_on_background, add='+')
     footer = ttk.Frame(host, padding=(8, 4))
     footer.pack(fill='x')
     ttk.Label(footer, textvariable=status, style='Muted.TLabel').pack(side='left', fill='x', expand=True)
     ttk.Label(toolbar, textvariable=pending, style='Muted.TLabel').pack(side='right', padx=8)
     ttk.Button(footer, text='History / Restore', command=app.genre_restore_history).pack(side='right', padx=5)
     ttk.Button(footer, text='Save Changes', command=write_changes, style='Accent.TButton').pack(side='right', padx=5)
+    ttk.Entry(footer, textvariable=target_genre, width=19).pack(side='right', padx=(4, 5))
+    ttk.Label(footer, text='New Genre (optional):').pack(side='right', padx=4)
     # A compact, independent control in each bottom corner; both default collapsed.
     task_toggle = tk.Label(host, text='▸ Tasks', bg='#30353E', fg=yellow, cursor='hand2', padx=10, pady=5)
     task_toggle.pack(side='bottom', anchor='w')
@@ -394,7 +430,7 @@ def open_genre_workspace(app):
             app._feedback_bar.pack_forget()
             task_toggle.configure(text='▸ Tasks')
         else:
-            app._feedback_bar.pack(fill='x', before=app.player_panel)
+            app._feedback_bar.pack(fill='x')
             task_toggle.configure(text='▾ Tasks')
     task_toggle.bind('<Button-1>', toggle_tasks)
     player_toggle = tk.Label(host, text='▸ Player', bg='#30353E', fg=yellow, cursor='hand2', padx=10, pady=5)
