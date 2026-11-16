@@ -15,8 +15,8 @@ from urllib.parse import urlparse
 import requests
 
 REPO = 'manoffish14-doc/DJ-Tag-Manager'
-VERSION = '3.1.1'
-ZIP_NAME = 'DJ-Tag-Manager-v3-Mac.zip'
+VERSION = '3.1.2'
+ZIP_NAME = 'DJ-Tag-Manager-Mac.zip'
 CHECKSUM_NAME = ZIP_NAME + '.sha256'
 
 
@@ -26,8 +26,6 @@ def check_release():
     response.raise_for_status()
     release = response.json()
     assets = {a['name']: a for a in release.get('assets', [])}
-    if ZIP_NAME not in assets or CHECKSUM_NAME not in assets:
-        raise ValueError('The latest release does not include the Mac app and its checksum.')
     return release, assets
 
 
@@ -50,10 +48,10 @@ def _running_app():
     if not candidates:
         raise RuntimeError('Updater only works when running from the packaged Mac application.')
     app = candidates[0]
-    if app.name != 'DJ Tag Manager v3.app':
+    if app.name != 'DJ Tag Manager.app':
         raise RuntimeError('Unexpected application name; refusing to replace another app.')
     info = plistlib.loads((app / 'Contents' / 'Info.plist').read_bytes())
-    if info.get('CFBundleIdentifier') != 'com.djtagmanager.v3development':
+    if info.get('CFBundleIdentifier') != 'com.djtagmanager.app':
         raise RuntimeError('Unexpected application identity; update cancelled.')
     return app
 
@@ -79,15 +77,15 @@ def _install_worker(release, assets, root, status, button):
         extracted = base / 'extracted'
         extracted.mkdir()
         subprocess.run(['/usr/bin/ditto', '-x', '-k', str(archive), str(extracted)], check=True)
-        incoming = extracted / 'DJ Tag Manager v3.app'
+        incoming = extracted / 'DJ Tag Manager.app'
         info = plistlib.loads((incoming / 'Contents' / 'Info.plist').read_bytes())
-        if info.get('CFBundleIdentifier') != 'com.djtagmanager.v3development':
+        if info.get('CFBundleIdentifier') != 'com.djtagmanager.app':
             raise ValueError('Downloaded app has an unexpected bundle identifier.')
         helper = Path(getattr(sys, '_MEIPASS', Path(__file__).parent)) / 'update_helper.sh'
         if not helper.exists():
             raise FileNotFoundError('Bundled update_helper.sh is missing.')
-        backup = destination.with_name('DJ Tag Manager v3.previous.app')
-        pending = destination.with_name('DJ Tag Manager v3.incoming.app')
+        backup = destination.with_name('DJ Tag Manager.previous.app')
+        pending = destination.with_name('DJ Tag Manager.incoming.app')
         if backup.exists() or pending.exists():
             raise RuntimeError('A previous backup or pending update exists next to the app. Resolve it before updating.')
         log = base / 'install.log'
@@ -123,11 +121,15 @@ def show_update_dialog(root):
                 elif not tag.startswith('3.') or tuple(int(x) for x in tag.split('.')) <= tuple(int(x) for x in VERSION.split('.')):
                     status.config(text=f'Latest release {tag} is not a v3 update.')
                 else:
+                    if ZIP_NAME not in assets or CHECKSUM_NAME not in assets:
+                        status.config(text=f'Release {tag} is missing the Mac update ZIP or checksum.')
+                        return
                     status.config(text=f'Current: {VERSION}    Available: {tag}\nInstall will close and restart the app.')
                     install.config(state='normal', command=lambda: (install.config(state='disabled'),
                         status.config(text='Downloading and verifying update…'),
                         threading.Thread(target=_install_worker, args=(release, assets, root, status, install), daemon=True).start()))
             root.after(0, display)
         except Exception as exc:
-            root.after(0, lambda: status.config(text=f'Could not check updates: {exc}'))
+            error_message = str(exc) or type(exc).__name__
+            root.after(0, lambda message=error_message: status.config(text=f'Could not check updates: {message}'))
     threading.Thread(target=checked, daemon=True).start()

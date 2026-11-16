@@ -128,10 +128,9 @@ def open_genre_workspace(app):
             widget.pack(**options)
 
     app._close_genre_workspace = close
-    header = ttk.Frame(host, padding=(12, 10))
+    header = ttk.Frame(host, padding=(8, 2))
     header.pack(fill='x')
     ttk.Label(header, text='Genre Cleanup', font=('Helvetica', 20, 'bold')).pack(side='left')
-    ttk.Button(header, text='Back to Library', command=close).pack(side='right')
     toolbar = ttk.Frame(host, padding=(8, 2))
     toolbar.pack(fill='x')
     ttk.Label(toolbar, text='Search').pack(side='left', padx=(0, 6))
@@ -148,7 +147,7 @@ def open_genre_workspace(app):
     window_id = canvas.create_window((0, 0), window=inside, anchor='nw')
     inside.bind('<Configure>', lambda _: canvas.configure(scrollregion=canvas.bbox('all')))
 
-    COLUMN_WIDTH = 265
+    COLUMN_WIDTH = 245
     COLUMN_GAP = 12
     def size_columns(event=None):
         # Match the canvas viewport so the grid never scrolls sideways.
@@ -173,7 +172,7 @@ def open_genre_workspace(app):
         if not max_offset:
             return 'break'
         current = canvas.yview()[0] * content_height
-        pixels = (-delta * (0.7 if abs(delta) < 120 else 0.28))
+        pixels = (-delta * (2.0 if abs(delta) < 120 else 0.55))
         canvas.yview_moveto(max(0, min(max_offset, current + pixels)) / content_height)
         return 'break'
 
@@ -329,18 +328,20 @@ def open_genre_workspace(app):
         search = query.get().strip().casefold()
         visible = []
         for group, names in grouped.items():
-            eligible = names if show_all.get() else [name for name in names if genres.get(name)]
+            # Show All controls families, never the zero-track subgenre inventory.
+            # Searching can surface a predefined empty subgenre for discovery.
+            eligible = [name for name in names if genres.get(name) or (search and (search in name.casefold()))]
             shown = [name for name in eligible if not search or search in name.casefold() or search in group.casefold()]
-            if not shown:
+            if not shown and (not show_all.get() or search):
                 continue
             # A family is nonempty if any of its genres has songs in this library.
             visible.append((group, shown))
         available = max(1, canvas.winfo_width() - 12)
         columns = max(1, min(4, available // (COLUMN_WIDTH + COLUMN_GAP)))
         # Use the full row width while keeping cards within a reasonable size.
-        card_width = max(220, min(390, (available - 10 * columns) // columns))
-        for c in range(columns):
-            inside.grid_columnconfigure(c, weight=1, uniform='genre')
+        card_width = max(220, (available - 10 * columns) // columns)
+        for c in range(4):
+            inside.grid_columnconfigure(c, weight=1 if c < columns else 0, uniform='genre' if c < columns else '')
         for index, (group, shown) in enumerate(visible):
             column = tk.Frame(inside, bg=panel, width=card_width, padx=8, pady=8,
                               highlightbackground='#383B42', highlightthickness=1)
@@ -454,8 +455,12 @@ def open_genre_workspace(app):
             redraw()
     canvas.bind('<Button-1>', clear_on_background, add='+')
     inside.bind('<Button-1>', clear_on_background, add='+')
+    header.bind('<Button-1>', clear_on_background, add='+')
+    toolbar.bind('<Button-1>', clear_on_background, add='+')
+    footer_clear_targets = []
     footer = ttk.Frame(host, padding=(8, 4))
     footer.pack(fill='x')
+    footer.bind('<Button-1>', clear_on_background, add='+')
     ttk.Label(footer, textvariable=status, style='Muted.TLabel').pack(side='left', fill='x', expand=True)
     ttk.Label(toolbar, textvariable=pending, style='Muted.TLabel').pack(side='right', padx=8)
     ttk.Button(footer, text='History / Restore', command=app.genre_restore_history).pack(side='right', padx=5)
@@ -484,5 +489,7 @@ def open_genre_workspace(app):
             app.set_player_collapsed(False)
             player_toggle.configure(text='▾ Player')
     player_toggle.bind('<Button-1>', toggle_player)
+    host.bind('<Button-1>', clear_on_background, add='+')
+    viewport.bind('<Button-1>', clear_on_background, add='+')
     query.trace_add('write', redraw)
     redraw()
