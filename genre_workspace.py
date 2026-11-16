@@ -116,6 +116,7 @@ def open_genre_workspace(app):
     target_genre = tk.StringVar(value='')
     wheel_remainder = [0.0]
     refresh_job = [None]
+    column_state = [None]
     drag = {"source": None, "start": None, "moved": False, "target": None}
     dark, panel, fg, yellow = '#15171B', '#22252B', '#F2F3F5', '#FACC15'
 
@@ -162,10 +163,17 @@ def open_genre_workspace(app):
         # Match the canvas viewport so the grid never scrolls sideways.
         canvas.itemconfigure(window_id, width=canvas.winfo_width())
         canvas.configure(scrollregion=canvas.bbox('all'))
-        if event is not None and not drag['source']:
-            if refresh_job[0] is not None:
-                host.after_cancel(refresh_job[0])
-            refresh_job[0] = host.after(100, redraw)
+        if event is not None and not drag['source'] and not reorder['source']:
+            # Tk resizes existing cards continuously. Rebuild only when the
+            # responsive column breakpoint changes, during the resize itself.
+            available = max(1, canvas.winfo_width() - 12)
+            next_columns = max(1, min(3, available // (COLUMN_WIDTH + COLUMN_GAP)))
+            if next_columns != column_state[0] and refresh_job[0] is None:
+                def reflow():
+                    refresh_job[0] = None
+                    if host.winfo_exists():
+                        redraw()
+                refresh_job[0] = host.after_idle(reflow)
 
     canvas.bind('<Configure>', size_columns)
 
@@ -356,6 +364,7 @@ def open_genre_workspace(app):
             visible.append((group, shown))
         available = max(1, canvas.winfo_width() - 12)
         columns = max(1, min(3, available // (COLUMN_WIDTH + COLUMN_GAP)))
+        column_state[0] = columns
         # Use the full row width while keeping cards within a reasonable size.
         card_width = max(180, (available - 10 * columns) // columns)
         # Independent column stacks: a tall family never pushes down its neighbors.
@@ -381,8 +390,10 @@ def open_genre_workspace(app):
             def choose_family(g=group, entries=tuple(shown)):
                 if g in selected_families:
                     selected_families.remove(g)
+                    chosen.difference_update((g, name) for name in grouped.get(g, ()))
                 else:
                     selected_families.add(g)
+                    chosen.update((g, name) for name in grouped.get(g, ()))
                 redraw()
             heading = dark_action(column, ('☑ ' if all_selected else '□ ') +
                                   f'{group}  ({family_track_count(group, grouped, genres)})',
@@ -395,6 +406,7 @@ def open_genre_workspace(app):
                               font=('Helvetica', 15, 'bold'))
             handle.pack(side='right')
             handle._genre_click_target = True
+            handle.bind('<Button-1>', lambda e: 'break')
             def begin_reorder(event, g=group):
                 reorder.update(source=g, start=(event.x_root, event.y_root), moved=False, target=None)
                 return 'break'
@@ -525,10 +537,15 @@ def open_genre_workspace(app):
     def write_changes():
         # No preview or confirmation by design. The only mutation trigger is Save.
         override = target_genre.get().strip()
+        grouped, genres = families()
         assignments = {name: (override or group) for group, name in chosen}
+        for group in selected_families:
+            assignments[group] = override or group
+            for name in grouped.get(group, ()):
+                assignments[name] = override or group
         changes_by_path = plan_genre_writes(app.rows, assignments)
         if not changes_by_path:
-            refresh_status('No tracks require changes for the selected subgenres.')
+            refresh_status('No tracks require tag changes. Select genres containing tracks to write metadata.')
             return
         journal, errors = [], []
         for path, changes in changes_by_path.items():
@@ -545,6 +562,16 @@ def open_genre_workspace(app):
                 errors.append(f'{Path(path).name}: {exc}')
         if journal:
             app.store.history('genre_cleanup_written', {'files': journal})
+            if override:
+                known_groups = set(DEFAULT_GROUPS) | set(custom_groups)
+                if not is_duplicate_genre(override, known_groups):
+                    custom_groups.append(override)
+                for group, name in chosen:
+                    organization[name] = override
+                for group in selected_families:
+                    for name in grouped.get(group, ()):
+                        organization[name] = override
+                app.save_preferences()
         app.persist_library()
         chosen.clear()
         selected_families.clear()
